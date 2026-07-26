@@ -1,0 +1,56 @@
+name: Build & Release Firmware
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'firmware.ino'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls \
+            https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+
+      - name: Install libraries
+        run: arduino-cli lib install "MFRC522"
+
+      - name: Compile
+        run: |
+          mkdir -p sketch/firmware build
+          cp firmware.ino sketch/firmware/firmware.ino
+          arduino-cli compile \
+            --fqbn esp32:esp32:esp32s3 \
+            --output-dir build \
+            sketch/firmware
+          cp build/firmware.ino.bin firmware.bin
+          ls -la firmware.bin
+
+      - name: Read firmware version
+        id: ver
+        run: echo "version=$(grep -oP 'FW_VERSION\s+"\K[^"]+' firmware.ino)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: Firmware v${{ steps.ver.outputs.version }}
+          files: firmware.bin
+          make_latest: true
+          fail_on_unmatched_files: true

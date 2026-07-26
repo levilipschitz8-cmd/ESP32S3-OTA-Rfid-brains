@@ -6,13 +6,14 @@
 #include <WiFiClientSecure.h>
 #include <HTTPUpdate.h>
 #include <Preferences.h>
+#include <time.h>
 
 // ====== FIRST USB FLASH OF A BOARD: set 1, 2, 3...
 // ====== OTA RELEASE BUILDS: set 0 (each board keeps its stored number)
 #define BOARD_NUM 1
 // ===============================================================
 
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "1.0.1"
 
 const char* SUPABASE_URL      = "https://cofrgojpwdyzfhfqnlch.supabase.co";
 const char* SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNvZnJnb2pwd2R5emZoZnFubGNoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc0Mzg0MjIsImV4cCI6MjA5MzAxNDQyMn0.fc1dOwvHJEhRDDnfOzj4EpqhoN9qE2CWf9T8995yoBM";
@@ -133,6 +134,19 @@ void postEvent(const String& uid, const String& eventType) {
   http.end();
 }
 
+bool timeSynced() {
+  return time(nullptr) > 1600000000;   // sanity: after 2020 == NTP has synced
+}
+
+String isoNow() {
+  time_t now = time(nullptr);
+  struct tm t;
+  gmtime_r(&now, &t);
+  char buf[25];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &t);
+  return String(buf);
+}
+
 void postHeartbeat() {
   if (deviceId == "" || wifiMulti.run() != WL_CONNECTED) return;
   HTTPClient http;
@@ -142,7 +156,14 @@ void postHeartbeat() {
   http.addHeader("apikey", SUPABASE_ANON_KEY);
   http.addHeader("Authorization", String("Bearer ") + SUPABASE_ANON_KEY);
   http.addHeader("Prefer", "return=minimal");
-  http.PATCH("{\"last_seen\":\"now()\"}");
+  // Send the board's own flashed number so Supabase always shows the true device,
+  // plus a real ISO timestamp (the old "now()" string was rejected by Postgres,
+  // so last_seen never updated and every board looked offline).
+  String body = "{\"board_num\":" + String(boardNum);
+  if (timeSynced()) body += ",\"last_seen\":\"" + isoNow() + "\"";
+  body += "}";
+  int code = http.PATCH(body);
+  Serial.println("[heartbeat] board " + String(boardNum) + " -> HTTP " + String(code));
   http.end();
 }
 
@@ -189,6 +210,14 @@ void setup() {
   }
   Serial.println();
   Serial.println("Connected: " + WiFi.SSID());
+  Serial.println("IP: " + WiFi.localIP().toString());
+
+  // Get real UTC time from NTP so heartbeats carry a valid timestamp.
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  for (int i = 0; i < 20 && !timeSynced(); i++) {
+    delay(250);
+  }
+  Serial.println(timeSynced() ? "Time synced: " + isoNow() : "Time NOT synced");
 
   fetchIdentity();
 
