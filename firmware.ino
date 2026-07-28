@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.4"
+#define FW_VERSION "1.0.5"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -234,14 +234,25 @@ void checkOTA() {
   http.end();
 }
 
+// Read the RC522 version register with retries (long cables give occasional bad reads).
+byte readReaderVersion() {
+  byte v = 0;
+  for (int i = 0; i < 4; i++) {
+    v = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
+    if (v != 0x00 && v != 0xFF) break;
+    delay(5);
+  }
+  return v;
+}
+
 void startRC522() {
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
-  SPI.setFrequency(1000000);
-  mfrc522.PCD_Init();
-  delay(10);
-  byte v = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
-  rc522Ok = (v != 0x00 && v != 0xFF);
+  SPI.setFrequency(200000);              // 200 kHz: tolerant of long / noisy cables
   for (byte i = 0; i < 6; i++) mifareKey.keyByte[i] = 0xFF;
+  mfrc522.PCD_Init();
+  delay(50);
+  byte v = readReaderVersion();
+  rc522Ok = (v != 0x00 && v != 0xFF);
   if (rc522Ok) {
     mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_max);
     mfrc522.PCD_AntennaOn();
@@ -251,15 +262,15 @@ void startRC522() {
   }
 }
 
-// Hot-plug: detect an RC522 that is connected AFTER boot (and recover if unplugged).
+// Hot-plug: detect an RC522 connected AFTER boot, and recover from cable glitches.
 void serviceReader() {
-  byte v = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
+  byte v = readReaderVersion();
   bool present = (v != 0x00 && v != 0xFF);
   if (present && !rc522Ok) {
     startRC522();                         // reader just appeared -> initialize it
   } else if (!present && rc522Ok) {
     rc522Ok = false;
-    Serial.println("[rc522] reader disconnected");
+    Serial.println("[rc522] reader lost");
   }
 }
 
