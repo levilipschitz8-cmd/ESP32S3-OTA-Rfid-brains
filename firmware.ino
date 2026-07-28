@@ -6,21 +6,29 @@
 #include <WiFiClientSecure.h>
 #include <HTTPUpdate.h>
 #include <Preferences.h>
-#include <time.h>
 
-// ====== FIRST USB FLASH OF A BOARD: set 1, 2, 3...
-// ====== OTA RELEASE BUILDS: set 0 (each board keeps its stored number)
-#define BOARD_NUM 1
-// ===============================================================
+// ====== IDENTITY ======
+// OTA / generic build: leave these BLANK so each board keeps the identity
+// already stored in its flash. Only fill them in for a first USB provisioning flash.
+#define BOARD_NUM 0
+const char* BOARD_CODE = "";
+const char* DEVICE_ID  = "";
+const char* DEVICE_KEY = "";
+// ======================
 
-#define FW_VERSION "1.0.1"
+#define FW_VERSION "1.0.3"
 
-const char* SUPABASE_URL      = "https://cofrgojpwdyzfhfqnlch.supabase.co";
-const char* SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNvZnJnb2pwd2R5emZoZnFubGNoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc0Mzg0MjIsImV4cCI6MjA5MzAxNDQyMn0.fc1dOwvHJEhRDDnfOzj4EpqhoN9qE2CWf9T8995yoBM";
+const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
+const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
+const char* CMD_RESULT_URL  = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-command-result";
+const char* FW_VERSION_URL  = "https://raw.githubusercontent.com/levilipschitz8-cmd/ESP32S3-OTA-Rfid-brains/main/fw-version.txt";
+const char* FIRMWARE_URL    = "https://github.com/levilipschitz8-cmd/ESP32S3-OTA-Rfid-brains/releases/latest/download/firmware.bin";
 
-const char* IDENTITY_URL = "https://raw.githubusercontent.com/levilipschitz8-cmd/ESP32S3-OTA-Rfid-brains/main/identities.txt";
-const char* VERSION_URL  = "https://raw.githubusercontent.com/levilipschitz8-cmd/ESP32S3-OTA-Rfid-brains/main/version.txt";
-const char* FIRMWARE_URL = "https://github.com/levilipschitz8-cmd/ESP32S3-OTA-Rfid-brains/releases/latest/download/firmware.bin";
+Preferences prefs;
+int boardNum = BOARD_NUM;
+String deviceId = "";
+String deviceKey = "";
+String boardCode = "";
 
 #define SCK_PIN  12
 #define MISO_PIN 13
@@ -30,22 +38,70 @@ const char* FIRMWARE_URL = "https://github.com/levilipschitz8-cmd/ESP32S3-OTA-Rf
 
 WiFiMulti wifiMulti;
 MFRC522 mfrc522(SS_PIN, RST_PIN);
-Preferences prefs;
+MFRC522::MIFARE_Key mifareKey;
 
-int boardNum = 0;
-String deviceId = "";
+bool rc522Ok = false;
+bool firstBeat = true;
+bool wifiUp = false;
 String currentUID = "";
 unsigned long lastSeenAt = 0;
-unsigned long lastPresentPostAt = 0;
 unsigned long lastHeartbeatAt = 0;
-unsigned long lastOtaCheckAt = 0;
-unsigned long lastIdentityCheckAt = 0;
+unsigned long lastRfidPollAt = 0;
+unsigned long lastWifiCheckAt = 0;
+unsigned long lastOtaAt = 0;
+unsigned long lastReaderCheckAt = 0;
 
-const unsigned long REMOVE_TIMEOUT      = 15000;
-const unsigned long PRESENT_REFRESH     = 8000;
-const unsigned long HEARTBEAT_INTERVAL  = 6000;
-const unsigned long OTA_CHECK_INTERVAL  = 300000;   // 5 min
-const unsigned long IDENTITY_INTERVAL   = 600000;   // 10 min
+const unsigned long HEARTBEAT_INTERVAL   = 5000;
+const unsigned long RFID_POLL_INTERVAL   = 250;
+const unsigned long WIFI_CHECK_INTERVAL  = 5000;
+const unsigned long OTA_CHECK_INTERVAL   = 900000;   // 15 min
+const unsigned long READER_CHECK_INTERVAL = 3000;    // hot-plug re-check
+const unsigned long REMOVE_TIMEOUT       = 15000;
+
+void resolveIdentity() {
+  prefs.begin("ident", false);
+  if (strlen(DEVICE_ID) > 0 && strlen(DEVICE_KEY) > 0) {
+    prefs.putString("id",   DEVICE_ID);
+    prefs.putString("key",  DEVICE_KEY);
+    prefs.putInt("num", BOARD_NUM);
+    prefs.putString("code", BOARD_CODE);
+  }
+  deviceId  = prefs.getString("id",   "");
+  deviceKey = prefs.getString("key",  "");
+  boardNum  = prefs.getInt("num", BOARD_NUM);
+  boardCode = prefs.getString("code", "");
+  prefs.end();
+}
+
+String jsonStr(const String& s, const String& key) {
+  String pat = "\"" + key + "\":\"";
+  int i = s.indexOf(pat);
+  if (i < 0) return "";
+  i += pat.length();
+  int j = s.indexOf('"', i);
+  if (j < 0) return "";
+  return s.substring(i, j);
+}
+long jsonInt(const String& s, const String& key, long def) {
+  String pat = "\"" + key + "\":";
+  int i = s.indexOf(pat);
+  if (i < 0) return def;
+  i += pat.length();
+  while (i < (int)s.length() && s[i] == ' ') i++;
+  int j = i;
+  while (j < (int)s.length() && (isdigit(s[j]) || s[j] == '-')) j++;
+  if (j == i) return def;
+  return s.substring(i, j).toInt();
+}
+
+bool versionNewer(const String& remote, const String& local) {
+  int r0=0,r1=0,r2=0,l0=0,l1=0,l2=0;
+  sscanf(remote.c_str(), "%d.%d.%d", &r0,&r1,&r2);
+  sscanf(local.c_str(),  "%d.%d.%d", &l0,&l1,&l2);
+  if (r0 != l0) return r0 > l0;
+  if (r1 != l1) return r1 > l1;
+  return r2 > l2;
+}
 
 String uidToString(MFRC522::Uid uid) {
   String s = "";
@@ -58,124 +114,150 @@ String uidToString(MFRC522::Uid uid) {
   return s;
 }
 
-void fetchIdentity() {
-  if (boardNum == 0) return;
-  if (wifiMulti.run() != WL_CONNECTED) return;
+int postJson(const char* url, const String& body, String& respOut) {
+  if (WiFi.status() != WL_CONNECTED) return -1;
+  WiFiClientSecure client; client.setInsecure();
   HTTPClient http;
-  http.begin(IDENTITY_URL);
-  if (http.GET() == 200) {
-    String body = http.getString();
-    String prefix = String(boardNum) + "=";
-    int start = 0;
-    while (start < body.length()) {
-      int end = body.indexOf('\n', start);
-      if (end < 0) end = body.length();
-      String line = body.substring(start, end);
-      line.trim();
-      if (line.startsWith(prefix)) {
-        String newId = line.substring(prefix.length());
-        newId.trim();
-        if (newId.length() > 0 && newId != deviceId) {
-          deviceId = newId;
-          prefs.putString("devid", deviceId);
-          Serial.println("Identity updated: " + deviceId);
-        }
-        break;
-      }
-      start = end + 1;
-    }
-  }
+  http.setConnectTimeout(4000);
+  http.setTimeout(4000);
+  if (!http.begin(client, url)) return -2;
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Device-Id", deviceId);
+  http.addHeader("X-Device-Key", deviceKey);
+  int code = http.POST(body);
+  respOut = http.getString();
   http.end();
+  return code;
+}
+
+void postTagEvent(const String& uid, const String& eventType) {
+  String resp;
+  String body = "{\"tag_uid\":\"" + uid + "\",\"event_type\":\"" + eventType + "\"}";
+  int code = postJson(TAG_EVENT_URL, body, resp);
+  Serial.println("[tag] " + eventType + " " + uid + " -> code=" + String(code));
+}
+
+void postCommandResult(const String& cmdId, const String& status, const String& detail) {
+  String resp;
+  String body = "{\"command_id\":\"" + cmdId + "\",\"status\":\"" + status + "\",\"detail\":\"" + detail + "\"}";
+  int code = postJson(CMD_RESULT_URL, body, resp);
+  Serial.println("[cmd] result " + status + " (" + detail + ") -> code=" + String(code));
+}
+
+bool writeTagBlock(int block, const String& data, String& detail) {
+  if (!rc522Ok) { detail = "reader not detected"; return false; }
+  if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) {
+    detail = "no tag on reader"; return false;
+  }
+  byte buf[16];
+  memset(buf, 0, 16);
+  for (int i = 0; i < 16 && i < (int)data.length(); i++) buf[i] = (byte)data[i];
+  MFRC522::StatusCode st = mfrc522.PCD_Authenticate(
+      MFRC522::PICC_CMD_MF_AUTH_KEY_A, (byte)block, &mifareKey, &(mfrc522.uid));
+  if (st != MFRC522::STATUS_OK) {
+    detail = "auth failed";
+    mfrc522.PICC_HaltA(); mfrc522.PCD_StopCrypto1();
+    return false;
+  }
+  st = mfrc522.MIFARE_Write((byte)block, buf, 16);
+  bool ok = (st == MFRC522::STATUS_OK);
+  detail = ok ? ("wrote block " + String(block)) : "write failed";
+  mfrc522.PICC_HaltA(); mfrc522.PCD_StopCrypto1();
+  return ok;
+}
+
+void handleCommand(const String& resp) {
+  String cmd = jsonStr(resp, "command");
+  if (cmd == "" || cmd == "null") return;
+  String cmdId = jsonStr(resp, "command_id");
+  if (cmd == "write_tag") {
+    int block = (int)jsonInt(resp, "block", 4);
+    String data = jsonStr(resp, "data");
+    Serial.println("[cmd] write_tag id=" + cmdId + " block=" + String(block) + " data=" + data);
+    String detail;
+    bool ok = writeTagBlock(block, data, detail);
+    postCommandResult(cmdId, ok ? "ok" : "fail", detail);
+  } else {
+    postCommandResult(cmdId, "fail", "unknown command");
+  }
+}
+
+void sendHeartbeat() {
+  if (deviceId == "" || deviceKey == "") {
+    Serial.println("[id] MISSING IDENTITY - flash a board with DEVICE_ID/DEVICE_KEY - heartbeat disabled");
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) return;
+  String ip = WiFi.localIP().toString();
+  long rssi = WiFi.RSSI();
+  String body = String("{\"firmware_version\":\"") + FW_VERSION +
+                "\",\"ip\":\"" + ip +
+                "\",\"rssi\":" + String(rssi) +
+                ",\"board_code\":\"" + boardCode + "\"" +
+                ",\"boot\":" + (firstBeat ? "true" : "false") + "}";
+  String resp;
+  int code = postJson(HEARTBEAT_URL, body, resp);
+  String shortResp = resp.length() > 120 ? resp.substring(0, 120) : resp;
+  Serial.println("[hb] board=" + String(boardNum) + " code=" + String(code) +
+                 " rssi=" + String(rssi) + " ip=" + ip + " resp=" + shortResp);
+  if (code == 401) Serial.println("[hb] BAD DEVICE KEY - check X-Device-Key");
+  if (code <= 0)   Serial.println("[hb] NO CONNECTION code=" + String(code));
+  if (code == 200) { firstBeat = false; handleCommand(resp); }
 }
 
 void checkOTA() {
-  if (wifiMulti.run() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  WiFiClientSecure client; client.setInsecure();
   HTTPClient http;
-  http.begin(VERSION_URL);
-  if (http.GET() == 200) {
-    String body = http.getString();
-    body.trim();
+  http.setConnectTimeout(5000);
+  http.setTimeout(5000);
+  if (!http.begin(client, FW_VERSION_URL)) return;
+  int code = http.GET();
+  if (code == 200) {
+    String body = http.getString(); body.trim();
     int nl = body.indexOf('\n');
     String remoteVer = (nl < 0) ? body : body.substring(0, nl);
     String target    = (nl < 0) ? "all" : body.substring(nl + 1);
     remoteVer.trim(); target.trim();
-    if (remoteVer != FW_VERSION &&
-        (target == "all" || target == String(boardNum) || target == deviceId)) {
-      Serial.println("OTA: " + String(FW_VERSION) + " -> " + remoteVer);
+    bool targeted = (target == "all" || target == String(boardNum) || target == deviceId);
+    if (targeted && versionNewer(remoteVer, FW_VERSION)) {
+      Serial.println("[ota] " + String(FW_VERSION) + " -> " + remoteVer + " ... downloading");
       http.end();
-      WiFiClientSecure client;
-      client.setInsecure();
-      httpUpdate.update(client, FIRMWARE_URL);
+      WiFiClientSecure up; up.setInsecure();
+      httpUpdate.update(up, FIRMWARE_URL);
       return;
     }
   }
   http.end();
 }
 
-void postEvent(const String& uid, const String& eventType) {
-  if (deviceId == "") return;
-  int retries = 0;
-  while (wifiMulti.run() != WL_CONNECTED && retries < 10) {
-    delay(300);
-    retries++;
-  }
-  if (wifiMulti.run() != WL_CONNECTED) return;
-  HTTPClient http;
-  String url = String(SUPABASE_URL) + "/rest/v1/tag_events";
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("apikey", SUPABASE_ANON_KEY);
-  http.addHeader("Authorization", String("Bearer ") + SUPABASE_ANON_KEY);
-  String body = "{\"device_id\":\"" + deviceId + "\","
-                "\"tag_uid\":\"" + uid + "\","
-                "\"event_type\":\"" + eventType + "\"}";
-  int code = http.POST(body);
-  Serial.println("[" + eventType + "] " + uid + " -> HTTP " + String(code));
-  http.end();
-}
-
-bool timeSynced() {
-  return time(nullptr) > 1600000000;   // sanity: after 2020 == NTP has synced
-}
-
-String isoNow() {
-  time_t now = time(nullptr);
-  struct tm t;
-  gmtime_r(&now, &t);
-  char buf[25];
-  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &t);
-  return String(buf);
-}
-
-void postHeartbeat() {
-  if (deviceId == "" || wifiMulti.run() != WL_CONNECTED) return;
-  HTTPClient http;
-  String url = String(SUPABASE_URL) + "/rest/v1/devices?id=eq." + deviceId;
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("apikey", SUPABASE_ANON_KEY);
-  http.addHeader("Authorization", String("Bearer ") + SUPABASE_ANON_KEY);
-  http.addHeader("Prefer", "return=minimal");
-  // Send the board's own flashed number so Supabase always shows the true device,
-  // plus a real ISO timestamp (the old "now()" string was rejected by Postgres,
-  // so last_seen never updated and every board looked offline).
-  String body = "{\"board_num\":" + String(boardNum);
-  if (timeSynced()) body += ",\"last_seen\":\"" + isoNow() + "\"";
-  body += "}";
-  int code = http.PATCH(body);
-  Serial.println("[heartbeat] board " + String(boardNum) + " -> HTTP " + String(code));
-  http.end();
-}
-
 void startRC522() {
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
   SPI.setFrequency(1000000);
-  delay(200);
   mfrc522.PCD_Init();
-  delay(200);
-  mfrc522.PCD_DumpVersionToSerial();
-  mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_max);
-  Serial.println("RC522 ready");
+  delay(10);
+  byte v = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
+  rc522Ok = (v != 0x00 && v != 0xFF);
+  for (byte i = 0; i < 6; i++) mifareKey.keyByte[i] = 0xFF;
+  if (rc522Ok) {
+    mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_max);
+    mfrc522.PCD_AntennaOn();
+    Serial.println("[rc522] ready (v0x" + String(v, HEX) + ")");
+  } else {
+    Serial.println("[rc522] NOT DETECTED (v0x" + String(v, HEX) + ") - heartbeat continues anyway");
+  }
+}
+
+// Hot-plug: detect an RC522 that is connected AFTER boot (and recover if unplugged).
+void serviceReader() {
+  byte v = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
+  bool present = (v != 0x00 && v != 0xFF);
+  if (present && !rc522Ok) {
+    startRC522();                         // reader just appeared -> initialize it
+  } else if (!present && rc522Ok) {
+    rc522Ok = false;
+    Serial.println("[rc522] reader disconnected");
+  }
 }
 
 bool isTagStillPresent() {
@@ -188,84 +270,101 @@ bool isTagStillPresent() {
   return (result == MFRC522::STATUS_OK || result == MFRC522::STATUS_COLLISION);
 }
 
-void setup() {
-  Serial.begin(115200);
-  delay(500);
-
-  prefs.begin("rfid", false);
-  if (BOARD_NUM > 0) prefs.putInt("boardnum", BOARD_NUM);
-  boardNum = prefs.getInt("boardnum", 0);
-  deviceId = prefs.getString("devid", "");
-  Serial.println("Board #" + String(boardNum) + " FW " + FW_VERSION);
-  Serial.println("Stored identity: " + (deviceId == "" ? "NONE" : deviceId));
-
-  wifiMulti.addAP("Esp32Test",            "12345678");
-  wifiMulti.addAP("Cottages",             "C0ttage@37");
-  wifiMulti.addAP("ABSolutely Connected", "Wifi@613");
-
-  Serial.print("Connecting to WiFi");
-  while (wifiMulti.run() != WL_CONNECTED) {
-    delay(300);
-    Serial.print(".");
-  }
-  Serial.println();
-  Serial.println("Connected: " + WiFi.SSID());
-  Serial.println("IP: " + WiFi.localIP().toString());
-
-  // Get real UTC time from NTP so heartbeats carry a valid timestamp.
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-  for (int i = 0; i < 20 && !timeSynced(); i++) {
-    delay(250);
-  }
-  Serial.println(timeSynced() ? "Time synced: " + isoNow() : "Time NOT synced");
-
-  fetchIdentity();
-
-  delay(500);
-  Serial.println("Initializing RC522...");
-  startRC522();
-}
-
-void loop() {
-  if (millis() - lastHeartbeatAt > HEARTBEAT_INTERVAL) {
-    postHeartbeat();
-    lastHeartbeatAt = millis();
-  }
-  if (millis() - lastOtaCheckAt > OTA_CHECK_INTERVAL) {
-    checkOTA();
-    lastOtaCheckAt = millis();
-  }
-  if (millis() - lastIdentityCheckAt > IDENTITY_INTERVAL) {
-    fetchIdentity();
-    lastIdentityCheckAt = millis();
-  }
-
+void pollRfid() {
+  if (!rc522Ok) return;
   if (currentUID != "") {
     if (isTagStillPresent()) {
       lastSeenAt = millis();
-      if (millis() - lastPresentPostAt > PRESENT_REFRESH) {
-        postEvent(currentUID, "present");
-        lastPresentPostAt = millis();
-      }
     } else if (millis() - lastSeenAt > REMOVE_TIMEOUT) {
       Serial.println("Tag removed: " + currentUID);
-      postEvent(currentUID, "removed");
+      postTagEvent(currentUID, "removed");
       currentUID = "";
       mfrc522.PCD_Init();
     }
     return;
   }
-
   if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
-    String uid = uidToString(mfrc522.uid);
-    currentUID = uid;
+    currentUID = uidToString(mfrc522.uid);
     lastSeenAt = millis();
-    lastPresentPostAt = millis();
-    postEvent(uid, "present");
-    Serial.println("Tag present: " + uid);
+    Serial.println("Tag present: " + currentUID);
+    postTagEvent(currentUID, "present");
     mfrc522.PICC_HaltA();
     mfrc522.PCD_StopCrypto1();
   }
+}
 
-  delay(200);
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  resolveIdentity();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(true);
+  WiFi.setAutoReconnect(true);
+  wifiMulti.addAP("Esp32Test",            "12345678");
+  wifiMulti.addAP("Cottages",             "C0ttage@37");
+  wifiMulti.addAP("ABSolutely Connected", "Wifi@613");
+
+  Serial.println("========================================");
+  Serial.println("FW " + String(FW_VERSION) + "  board #" + String(boardNum) + "  code=" + boardCode);
+  Serial.print("Connecting WiFi");
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) { wifiMulti.run(); delay(20); }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiUp = true;
+    Serial.println("SSID " + WiFi.SSID());
+    Serial.println("IP   " + WiFi.localIP().toString());
+    Serial.println("MAC " + WiFi.macAddress());
+  } else {
+    Serial.println("WiFi not up yet - will keep retrying");
+  }
+
+  if (deviceId != "" && deviceKey != "")
+    Serial.println("[id] board=" + String(boardNum) + " code=" + boardCode + " id=" + deviceId + " keyLen=" + String(deviceKey.length()));
+  else
+    Serial.println("[id] MISSING IDENTITY - flash with DEVICE_ID/DEVICE_KEY set once");
+
+  startRC522();
+  Serial.println("========================================");
+
+  lastHeartbeatAt = millis() - HEARTBEAT_INTERVAL;
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  if (now - lastWifiCheckAt >= WIFI_CHECK_INTERVAL) {
+    lastWifiCheckAt = now;
+    if (WiFi.status() != WL_CONNECTED) {
+      wifiUp = false;
+      Serial.println("[wifi] reconnecting...");
+      wifiMulti.run();
+    } else if (!wifiUp) {
+      wifiUp = true;
+      Serial.println("[wifi] back up - IP " + WiFi.localIP().toString());
+      lastHeartbeatAt = now - HEARTBEAT_INTERVAL;
+    }
+  }
+
+  if (now - lastHeartbeatAt >= HEARTBEAT_INTERVAL) {
+    lastHeartbeatAt = now;
+    sendHeartbeat();
+  }
+
+  if (now - lastReaderCheckAt >= READER_CHECK_INTERVAL) {
+    lastReaderCheckAt = now;
+    serviceReader();
+  }
+
+  if (now - lastOtaAt >= OTA_CHECK_INTERVAL) {
+    lastOtaAt = now;
+    checkOTA();
+  }
+
+  if (now - lastRfidPollAt >= RFID_POLL_INTERVAL) {
+    lastRfidPollAt = now;
+    pollRfid();
+  }
 }
