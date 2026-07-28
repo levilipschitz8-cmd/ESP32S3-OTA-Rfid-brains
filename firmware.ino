@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.3"
+#define FW_VERSION "1.0.4"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -54,7 +54,7 @@ unsigned long lastReaderCheckAt = 0;
 const unsigned long HEARTBEAT_INTERVAL   = 5000;
 const unsigned long RFID_POLL_INTERVAL   = 250;
 const unsigned long WIFI_CHECK_INTERVAL  = 5000;
-const unsigned long OTA_CHECK_INTERVAL   = 900000;   // 15 min
+const unsigned long OTA_CHECK_INTERVAL   = 60000;    // 60s
 const unsigned long READER_CHECK_INTERVAL = 3000;    // hot-plug re-check
 const unsigned long REMOVE_TIMEOUT       = 15000;
 
@@ -224,7 +224,10 @@ void checkOTA() {
       Serial.println("[ota] " + String(FW_VERSION) + " -> " + remoteVer + " ... downloading");
       http.end();
       WiFiClientSecure up; up.setInsecure();
-      httpUpdate.update(up, FIRMWARE_URL);
+      httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+      t_httpUpdate_return r = httpUpdate.update(up, FIRMWARE_URL);
+      if (r == HTTP_UPDATE_FAILED)
+        Serial.println("[ota] FAILED: " + String(httpUpdate.getLastError()) + " " + httpUpdate.getLastErrorString());
       return;
     }
   }
