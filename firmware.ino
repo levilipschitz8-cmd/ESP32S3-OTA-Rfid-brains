@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.5"
+#define FW_VERSION "1.0.6"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -56,7 +56,7 @@ const unsigned long RFID_POLL_INTERVAL   = 250;
 const unsigned long WIFI_CHECK_INTERVAL  = 5000;
 const unsigned long OTA_CHECK_INTERVAL   = 60000;    // 60s
 const unsigned long READER_CHECK_INTERVAL = 3000;    // hot-plug re-check
-const unsigned long REMOVE_TIMEOUT       = 15000;
+const unsigned long REMOVE_TIMEOUT       = 1000;     // ~1s: report tag removed quickly (glitch-filtered)
 
 void resolveIdentity() {
   prefs.begin("ident", false);
@@ -247,7 +247,7 @@ byte readReaderVersion() {
 
 void startRC522() {
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
-  SPI.setFrequency(200000);              // 200 kHz: tolerant of long / noisy cables
+  SPI.setFrequency(100000);              // 100 kHz: for very long (~3 m) cables
   for (byte i = 0; i < 6; i++) mifareKey.keyByte[i] = 0xFF;
   mfrc522.PCD_Init();
   delay(50);
@@ -276,12 +276,18 @@ void serviceReader() {
 
 bool isTagStillPresent() {
   byte bufferATQA[2];
-  byte bufferSize = sizeof(bufferATQA);
-  mfrc522.PCD_WriteRegister(mfrc522.TxModeReg, 0x00);
-  mfrc522.PCD_WriteRegister(mfrc522.RxModeReg, 0x00);
-  mfrc522.PCD_WriteRegister(mfrc522.ModWidthReg, 0x26);
-  MFRC522::StatusCode result = mfrc522.PICC_WakeupA(bufferATQA, &bufferSize);
-  return (result == MFRC522::STATUS_OK || result == MFRC522::STATUS_COLLISION);
+  byte bufferSize;
+  // Retry: on a long/noisy cable a single check can glitch even with the tag present.
+  // Only if all attempts fail do we treat the tag as gone -> no false "removed".
+  for (int attempt = 0; attempt < 3; attempt++) {
+    mfrc522.PCD_WriteRegister(mfrc522.TxModeReg, 0x00);
+    mfrc522.PCD_WriteRegister(mfrc522.RxModeReg, 0x00);
+    mfrc522.PCD_WriteRegister(mfrc522.ModWidthReg, 0x26);
+    bufferSize = sizeof(bufferATQA);
+    MFRC522::StatusCode result = mfrc522.PICC_WakeupA(bufferATQA, &bufferSize);
+    if (result == MFRC522::STATUS_OK || result == MFRC522::STATUS_COLLISION) return true;
+  }
+  return false;
 }
 
 void pollRfid() {
