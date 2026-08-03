@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.8"
+#define FW_VERSION "1.0.9"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -43,6 +43,7 @@ MFRC522::MIFARE_Key mifareKey;
 bool rc522Ok = false;
 bool firstBeat = true;
 bool wifiUp = false;
+bool everConnected = false;             // reached the server at least once this boot
 String currentUID = "";
 unsigned long lastSeenAt = 0;
 unsigned long lastHeartbeatAt = 0;
@@ -204,7 +205,7 @@ void sendHeartbeat() {
                  " rssi=" + String(rssi) + " ip=" + ip + " resp=" + shortResp);
   if (code == 401) Serial.println("[hb] BAD DEVICE KEY - check X-Device-Key");
   if (code <= 0)   Serial.println("[hb] NO CONNECTION code=" + String(code));
-  if (code == 200) { firstBeat = false; lastGoodContactAt = millis(); handleCommand(resp); }
+  if (code == 200) { firstBeat = false; everConnected = true; lastGoodContactAt = millis(); handleCommand(resp); }
 }
 
 void checkOTA() {
@@ -360,8 +361,10 @@ void loop() {
 
   // Offline watchdog: if the board can't reach the server for OFFLINE_REBOOT_TIMEOUT,
   // it's stuck (wedged WiFi/TCP) -> hard reboot to force a clean reconnect.
-  if (now - lastGoodContactAt > OFFLINE_REBOOT_TIMEOUT) {
-    Serial.println("[watchdog] no server contact for 60s - rebooting");
+  // Only reboot if we HAD contact this boot and then lost it for 60s (a wedge).
+  // If we never connected (no network here), don't reboot-loop - just keep trying.
+  if (everConnected && now - lastGoodContactAt > OFFLINE_REBOOT_TIMEOUT) {
+    Serial.println("[watchdog] lost server contact for 60s - rebooting to recover");
     delay(50);
     ESP.restart();
   }
