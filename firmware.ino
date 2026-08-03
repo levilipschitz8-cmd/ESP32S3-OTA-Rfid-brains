@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.7"
+#define FW_VERSION "1.0.8"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -50,12 +50,14 @@ unsigned long lastRfidPollAt = 0;
 unsigned long lastWifiCheckAt = 0;
 unsigned long lastOtaAt = 0;
 unsigned long lastReaderCheckAt = 0;
+unsigned long lastGoodContactAt = 0;   // last successful (200) heartbeat
 
 const unsigned long HEARTBEAT_INTERVAL   = 5000;
 const unsigned long RFID_POLL_INTERVAL   = 250;
 const unsigned long WIFI_CHECK_INTERVAL  = 5000;
 const unsigned long OTA_CHECK_INTERVAL   = 60000;    // 60s
 const unsigned long READER_CHECK_INTERVAL = 3000;    // hot-plug re-check
+const unsigned long OFFLINE_REBOOT_TIMEOUT = 60000;  // no server contact for 60s -> self-reboot
 const unsigned long REMOVE_TIMEOUT       = 1000;     // ~1s: report tag removed quickly (glitch-filtered)
 
 void resolveIdentity() {
@@ -202,7 +204,7 @@ void sendHeartbeat() {
                  " rssi=" + String(rssi) + " ip=" + ip + " resp=" + shortResp);
   if (code == 401) Serial.println("[hb] BAD DEVICE KEY - check X-Device-Key");
   if (code <= 0)   Serial.println("[hb] NO CONNECTION code=" + String(code));
-  if (code == 200) { firstBeat = false; handleCommand(resp); }
+  if (code == 200) { firstBeat = false; lastGoodContactAt = millis(); handleCommand(resp); }
 }
 
 void checkOTA() {
@@ -350,10 +352,19 @@ void setup() {
   Serial.println("========================================");
 
   lastHeartbeatAt = millis() - HEARTBEAT_INTERVAL;
+  lastGoodContactAt = millis();          // grace period before the offline watchdog can fire
 }
 
 void loop() {
   unsigned long now = millis();
+
+  // Offline watchdog: if the board can't reach the server for OFFLINE_REBOOT_TIMEOUT,
+  // it's stuck (wedged WiFi/TCP) -> hard reboot to force a clean reconnect.
+  if (now - lastGoodContactAt > OFFLINE_REBOOT_TIMEOUT) {
+    Serial.println("[watchdog] no server contact for 60s - rebooting");
+    delay(50);
+    ESP.restart();
+  }
 
   if (now - lastWifiCheckAt >= WIFI_CHECK_INTERVAL) {
     lastWifiCheckAt = now;
