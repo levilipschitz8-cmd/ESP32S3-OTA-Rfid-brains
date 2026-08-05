@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.9"
+#define FW_VERSION "1.0.10"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -250,16 +250,20 @@ byte readReaderVersion() {
 
 void startRC522() {
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
-  SPI.setFrequency(100000);              // 100 kHz: for very long (~3 m) cables
+  SPI.setFrequency(50000);               // 50 kHz: maximum tolerance for very long (~3 m) cables
   for (byte i = 0; i < 6; i++) mifareKey.keyByte[i] = 0xFF;
   mfrc522.PCD_Init();
   delay(50);
   byte v = readReaderVersion();
   rc522Ok = (v != 0x00 && v != 0xFF);
   if (rc522Ok) {
-    mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_max);
+    mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_max);        // max receive sensitivity (48 dB)
     mfrc522.PCD_AntennaOn();
-    Serial.println("[rc522] ready (v0x" + String(v, HEX) + ")");
+    // Drive the antenna as hard as the chip allows -> strongest field / best range.
+    mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x27 << 1), 0xFF); // GsNReg  (CW+Mod N-driver = max)
+    mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x28 << 1), 0x3F); // CWGsPReg  (P-driver CW = max)
+    mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x29 << 1), 0x3F); // ModGsPReg (P-driver Mod = max)
+    Serial.println("[rc522] ready (v0x" + String(v, HEX) + ") - max gain + max drive");
   } else {
     Serial.println("[rc522] NOT DETECTED (v0x" + String(v, HEX) + ") - heartbeat continues anyway");
   }
@@ -306,7 +310,12 @@ void pollRfid() {
     }
     return;
   }
-  if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+  // Retry a few times per scan: over a long cable a faint tag often fails the first attempt.
+  bool found = false;
+  for (int attempt = 0; attempt < 5 && !found; attempt++) {
+    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) found = true;
+  }
+  if (found) {
     currentUID = uidToString(mfrc522.uid);
     lastSeenAt = millis();
     Serial.println("Tag present: " + currentUID);
