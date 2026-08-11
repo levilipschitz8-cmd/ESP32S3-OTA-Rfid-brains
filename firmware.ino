@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.17"
+#define FW_VERSION "1.0.18"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -299,19 +299,12 @@ void serviceReader() {
 void ensureAntennaOn() {
   byte tx = mfrc522.PCD_ReadRegister(mfrc522.TxControlReg);
   if ((tx & 0x03) == 0x03) return;                       // already on -> field already stable
+  // Just set the RF driver bits back on. Do NOT PCD_Reset/PCD_Init here: that wipes the
+  // max gain/drive config from startRC522() (those live in separate registers and survive
+  // the antenna toggling), weakening the field so the reader stops detecting. Then give
+  // the field a moment to build and the tag to power back up before we transceive.
   mfrc522.PCD_WriteRegister(mfrc522.TxControlReg, tx | 0x03);
-  if ((mfrc522.PCD_ReadRegister(mfrc522.TxControlReg) & 0x03) != 0x03) {
-    // Write refused -> reader wedged. Full reset recovery, then force on.
-    mfrc522.PCD_Reset();
-    delay(50);
-    mfrc522.PCD_Init();
-    mfrc522.PCD_AntennaOn();
-    mfrc522.PCD_WriteRegister(mfrc522.TxControlReg, 0x83);
-  }
-  // The field was OFF, so the tag just lost power. Give the field time to build and
-  // the tag to power back up before we transceive, or reads/presence-checks glitch
-  // (reads randomly, then false "removed" while the tag is still sitting there).
-  delay(10);
+  delay(8);
 }
 
 bool isTagStillPresent() {
