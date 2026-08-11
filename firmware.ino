@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.23"
+#define FW_VERSION "1.0.24"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -339,13 +339,10 @@ bool isTagStillPresent() {
 // got stuck "removed" and never flicked back. WUPA fixes that. Re-force the flaky field
 // before each attempt.
 String readTagUID() {
-  // If a tag was already present, a brownout can leave it stuck in a state that neither
-  // WUPA nor REQA wakes (only a physical re-seat cleared it). Briefly drop the field to
-  // force the tag to power-cycle back to a detectable state, then bring the field up.
-  if (currentUID != "") {
-    mfrc522.PCD_WriteRegister(mfrc522.TxControlReg, 0x80);   // RF off
-    delay(3);
-  }
+  // Same read path whether or not a tag is already being tracked. (An earlier version
+  // did an extra field-off/on step when a tag was present; this flaky reader choked on
+  // it, so a tracked tag could never be re-read - only a fresh detection worked, which
+  // is why swapping readers and back "fixed" it. Keep it uniform.)
   for (int attempt = 0; attempt < 5; attempt++) {
     ensureAntennaOn();
     byte atqa[2];
