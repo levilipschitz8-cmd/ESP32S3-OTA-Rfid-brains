@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.25"
+#define FW_VERSION "1.0.26"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -304,13 +304,19 @@ void serviceReader() {
 // can't see it -> false "removed"). Force the field on before each and every op.
 void ensureAntennaOn() {
   byte tx = mfrc522.PCD_ReadRegister(mfrc522.TxControlReg);
-  if ((tx & 0x03) == 0x03) return;                       // already on -> field already stable
-  // Just set the RF driver bits back on. Do NOT PCD_Reset/PCD_Init here: that wipes the
-  // max gain/drive config from startRC522() (those live in separate registers and survive
-  // the antenna toggling), weakening the field so the reader stops detecting. Then give
-  // the field a moment to build and the tag to power back up before we transceive.
+  if ((tx & 0x03) == 0x03) return;                       // already on
   mfrc522.PCD_WriteRegister(mfrc522.TxControlReg, tx | 0x03);
-  delay(8);
+  if ((mfrc522.PCD_ReadRegister(mfrc522.TxControlReg) & 0x03) != 0x03) {
+    // The antenna-enable write did NOT stick -> the reader/antenna is wedged. A full
+    // reset + re-init un-wedges it. THIS is the step that actually made these readers
+    // read; removing it in v1.0.18 is exactly when they stopped. Restored.
+    mfrc522.PCD_Reset();
+    delay(50);
+    mfrc522.PCD_Init();
+    mfrc522.PCD_AntennaOn();
+    mfrc522.PCD_WriteRegister(mfrc522.TxControlReg, 0x83);
+  }
+  delay(8);   // let the field build + the tag power up before we transceive
 }
 
 bool isTagStillPresent() {
