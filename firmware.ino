@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.16"
+#define FW_VERSION "1.0.17"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -298,15 +298,20 @@ void serviceReader() {
 // can't see it -> false "removed"). Force the field on before each and every op.
 void ensureAntennaOn() {
   byte tx = mfrc522.PCD_ReadRegister(mfrc522.TxControlReg);
-  if ((tx & 0x03) == 0x03) return;                       // already on
+  if ((tx & 0x03) == 0x03) return;                       // already on -> field already stable
   mfrc522.PCD_WriteRegister(mfrc522.TxControlReg, tx | 0x03);
-  if ((mfrc522.PCD_ReadRegister(mfrc522.TxControlReg) & 0x03) == 0x03) return;  // stuck on
-  // Write refused -> reader wedged. Full reset recovery, then force on.
-  mfrc522.PCD_Reset();
-  delay(50);
-  mfrc522.PCD_Init();
-  mfrc522.PCD_AntennaOn();
-  mfrc522.PCD_WriteRegister(mfrc522.TxControlReg, 0x83);
+  if ((mfrc522.PCD_ReadRegister(mfrc522.TxControlReg) & 0x03) != 0x03) {
+    // Write refused -> reader wedged. Full reset recovery, then force on.
+    mfrc522.PCD_Reset();
+    delay(50);
+    mfrc522.PCD_Init();
+    mfrc522.PCD_AntennaOn();
+    mfrc522.PCD_WriteRegister(mfrc522.TxControlReg, 0x83);
+  }
+  // The field was OFF, so the tag just lost power. Give the field time to build and
+  // the tag to power back up before we transceive, or reads/presence-checks glitch
+  // (reads randomly, then false "removed" while the tag is still sitting there).
+  delay(10);
 }
 
 bool isTagStillPresent() {
@@ -335,7 +340,9 @@ void pollRfid() {
       Serial.println("Tag removed: " + currentUID);
       postTagEvent(currentUID, "removed");
       currentUID = "";
-      mfrc522.PCD_Init();
+      // Do NOT PCD_Init() here. On these boards it wipes the antenna/gain/drive config,
+      // leaving the reader deaf to the next tag. The scan path re-forces the field via
+      // ensureAntennaOn(), and the gain/drive from startRC522() stays intact.
     }
     return;
   }
