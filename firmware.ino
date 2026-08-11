@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.29"
+#define FW_VERSION "1.0.30"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -344,41 +344,23 @@ bool isTagStillPresent() {
   return false;
 }
 
-// Set the antenna P/N driver strength (how hard the reader drives its coil).
-void setAntennaDrive(byte gsn, byte cwgsp, byte modgsp) {
-  mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x27 << 1), gsn);    // GsNReg
-  mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x28 << 1), cwgsp);  // CWGsPReg
-  mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x29 << 1), modgsp); // ModGsPReg
-}
-
 // Read a tag UID this poll, or "" if none. Uses WakeupA (WUPA), which wakes BOTH fresh
 // (IDLE) and already-read (HALT) tags. PICC_IsNewCardPresent()/REQA does NOT wake a
 // halted tag, so after we read+halt a tag it could never be re-detected -> the reader
 // got stuck "removed" and never flicked back. WUPA fixes that. Re-force the flaky field
 // before each attempt.
 String readTagUID() {
-  // Different RC522/HW-126 clones have differently-tuned antennas, so ONE fixed RF setup
-  // reads some readers and leaves others blind (why only certain reader+board pairs work).
-  // Forcing MAXIMUM drive suits this one HW-126 but can detune/saturate a properly-tuned
-  // coil (e.g. a genuine 522), killing its range. So sweep several gain+drive profiles:
-  //   - MAX drive + high gain first  -> the working HW-126 reads on attempt 0, returns
-  //     immediately, totally unaffected.
-  //   - then progressively back off to the stock/default drive a genuine reader wants.
-  // Whatever RF profile THIS particular reader likes, one of these hits it.
-  struct RfProfile { byte gain, gsn, cwgsp, modgsp; };
-  static const RfProfile profiles[6] = {
-    { 0x70, 0xFF, 0x3F, 0x3F },   // max gain, max drive   (the proven HW-126 config)
-    { 0x60, 0xFF, 0x3F, 0x3F },   // 43dB,    max drive
-    { 0x70, 0x88, 0x20, 0x20 },   // max gain, STOCK drive (genuine-reader default)
-    { 0x50, 0x88, 0x20, 0x20 },   // 38dB,    stock drive
-    { 0x40, 0x88, 0x20, 0x20 },   // 33dB,    stock drive
-    { 0x70, 0xF4, 0x28, 0x28 },   // max gain, mid drive
-  };
-  for (int attempt = 0; attempt < 6; attempt++) {
+  // Cheap RC522 clones vary a lot in RF tuning, so one fixed receive-gain reads some
+  // readers and not others (why only certain reader+board pairs work). Try a different
+  // gain each attempt so whatever THIS reader likes, we hit it. A reader that already
+  // works reads on the first (max-gain) attempt and returns immediately, unaffected.
+  // NOTE: we deliberately DO NOT touch the antenna drive registers here - changing drive
+  // per-attempt (tried in 1.0.29) detuned the readers that already worked. Drive stays at
+  // the fixed max set once in startRC522(), which is the config that reads reliably.
+  static const byte gainSteps[5] = { 0x70, 0x60, 0x50, 0x40, 0x10 };  // 48,43,38,33,23 dB
+  for (int attempt = 0; attempt < 5; attempt++) {
+    mfrc522.PCD_SetAntennaGain(gainSteps[attempt]);
     ensureAntennaOn();
-    mfrc522.PCD_SetAntennaGain(profiles[attempt].gain);
-    setAntennaDrive(profiles[attempt].gsn, profiles[attempt].cwgsp, profiles[attempt].modgsp);
-    delay(2);                                // let the field settle at the new drive level
     byte atqa[2];
     byte size = sizeof(atqa);
     MFRC522::StatusCode s = mfrc522.PICC_WakeupA(atqa, &size);
