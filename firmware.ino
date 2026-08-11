@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.22"
+#define FW_VERSION "1.0.23"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -46,6 +46,7 @@ bool wifiUp = false;
 bool everConnected = false;             // reached the server at least once this boot
 String currentUID = "";
 unsigned long lastSeenAt = 0;
+unsigned long lastReaderRefreshAt = 0;  // last auto re-init while a tag was present but unreadable
 unsigned long lastHeartbeatAt = 0;
 unsigned long lastRfidPollAt = 0;
 unsigned long lastWifiCheckAt = 0;
@@ -62,6 +63,9 @@ const unsigned long OFFLINE_REBOOT_TIMEOUT = 60000;  // no server contact for 60
 const unsigned long REMOVE_TIMEOUT       = 4000;     // 4s of continuous no-see before "removed".
                                                      // These flaky boards drop the field intermittently;
                                                      // a short timeout caused false present/removed flapping.
+const unsigned long READER_REFRESH_MS    = 700;      // while a tag is present but unreadable, auto re-init
+                                                     // the reader this often (mimics a physical re-plug,
+                                                     // which is what recovers this flaky reader).
 
 void resolveIdentity() {
   prefs.begin("ident", false);
@@ -369,10 +373,20 @@ void pollRfid() {
       postTagEvent(currentUID, "present");
     }
     // same tag still sitting there -> just refresh lastSeenAt, no repeat "present"
-  } else if (currentUID != "" && millis() - lastSeenAt > REMOVE_TIMEOUT) {
-    Serial.println("Tag removed: " + currentUID);
-    postTagEvent(currentUID, "removed");
-    currentUID = "";
+  } else if (currentUID != "") {
+    // We HAD a tag but can't read it now. This reader degrades after reading and only
+    // recovers on a fresh init - which is exactly why physically re-plugging it makes it
+    // read again (the re-plug triggers startRC522). Do that re-init automatically
+    // (throttled) so it recovers on its own without anyone touching the hardware.
+    if (millis() - lastReaderRefreshAt > READER_REFRESH_MS) {
+      lastReaderRefreshAt = millis();
+      startRC522();
+    }
+    if (millis() - lastSeenAt > REMOVE_TIMEOUT) {
+      Serial.println("Tag removed: " + currentUID);
+      postTagEvent(currentUID, "removed");
+      currentUID = "";
+    }
   }
 }
 
