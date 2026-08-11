@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.31"
+#define FW_VERSION "1.0.32"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -289,21 +289,13 @@ void startRC522() {
 
 // Hot-plug: detect an RC522 connected AFTER boot, and recover from cable glitches.
 void serviceReader() {
-  static byte missCount = 0;
   byte v = readReaderVersion();
   bool present = (v != 0x00 && v != 0xFF);
-  if (present) {
-    missCount = 0;
-    if (!rc522Ok) startRC522();           // reader (re)appeared -> initialize it
-  } else if (rc522Ok) {
-    // Transient version-read glitches are normal on this flaky reader and do NOT mean it
-    // is gone. Only declare it lost after several consecutive misses, so one glitch does
-    // not drop reads. ensureAntennaOn()'s reset-recovery keeps the reader alive meanwhile.
-    if (++missCount >= 5) {
-      rc522Ok = false;
-      missCount = 0;
-      Serial.println("[rc522] reader lost");
-    }
+  if (present && !rc522Ok) {
+    startRC522();                         // reader (re)appeared -> initialize it
+  } else if (!present && rc522Ok) {
+    rc522Ok = false;
+    Serial.println("[rc522] reader lost");
   }
 }
 
@@ -350,16 +342,11 @@ bool isTagStillPresent() {
 // got stuck "removed" and never flicked back. WUPA fixes that. Re-force the flaky field
 // before each attempt.
 String readTagUID() {
-  // Cheap RC522 clones vary a lot in RF tuning, so one fixed receive-gain reads some
-  // readers and not others (why only certain reader+board pairs work). Try a different
-  // gain each attempt so whatever THIS reader likes, we hit it. A reader that already
-  // works reads on the first (max-gain) attempt and returns immediately, unaffected.
-  // NOTE: we deliberately DO NOT touch the antenna drive registers here - changing drive
-  // per-attempt (tried in 1.0.29) detuned the readers that already worked. Drive stays at
-  // the fixed max set once in startRC522(), which is the config that reads reliably.
-  static const byte gainSteps[5] = { 0x70, 0x60, 0x50, 0x40, 0x10 };  // 48,43,38,33,23 dB
+  // Same read path whether or not a tag is already being tracked. (An earlier version
+  // did an extra field-off/on step when a tag was present; this flaky reader choked on
+  // it, so a tracked tag could never be re-read - only a fresh detection worked, which
+  // is why swapping readers and back "fixed" it. Keep it uniform.)
   for (int attempt = 0; attempt < 5; attempt++) {
-    mfrc522.PCD_SetAntennaGain(gainSteps[attempt]);
     ensureAntennaOn();
     byte atqa[2];
     byte size = sizeof(atqa);
@@ -386,14 +373,7 @@ void pollRfid() {
       postTagEvent(currentUID, "present");
     }
     // same tag still sitting there -> just refresh lastSeenAt, no repeat "present"
-    // same tag still sitting there -> just refresh lastSeenAt, no repeat "present"
   } else if (currentUID != "" && millis() - lastSeenAt > REMOVE_TIMEOUT) {
-    // A single missed read is normal and does NOT mean the reader wedged. With a clean
-    // power supply the readers are healthy, so we must NOT slam them with a full reset on
-    // every miss (1.0.28 did that every 700ms -> a reset knocked out the next read -> more
-    // resets -> the present/removed/reader-lost thrash). readTagUID() already re-forces the
-    // antenna gently each poll; that is all the recovery a healthy reader needs. Just wait
-    // out REMOVE_TIMEOUT of continuous no-see before accepting the tag as genuinely gone.
     Serial.println("Tag removed: " + currentUID);
     postTagEvent(currentUID, "removed");
     currentUID = "";
