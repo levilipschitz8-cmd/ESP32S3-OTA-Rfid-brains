@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.35"
+#define FW_VERSION "1.0.36"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -278,9 +278,18 @@ void serviceReader() {
   byte v = readReaderVersion();
   lastReaderVersion = v;
   bool present = (v != 0x00 && v != 0xFF);
-  if (present && !rc522Ok) {
-    startRC522();                         // reader just appeared -> initialize it
-  } else if (!present && rc522Ok) {
+  if (present) {
+    // Re-init when either (a) we don't think a reader is up, or (b) a reader IS present but
+    // is NOT carrying our configuration. Case (b) is the HOT-SWAP fix: if you pull one reader
+    // and plug another in between version checks, rc522Ok never goes false, so the new reader
+    // would sit uninitialised (antenna off, wrong mode) and read nothing until a manual RST.
+    // GsNReg (0x27) is set to 0xFF ONLY by startRC522() and is never touched by the read path,
+    // so a freshly powered reader (default GsN != 0xFF) reliably trips this and gets init'd.
+    byte gsn = mfrc522.PCD_ReadRegister((MFRC522::PCD_Register)(0x27 << 1));
+    if (!rc522Ok || gsn != 0xFF) {
+      startRC522();                       // new/uninitialised reader -> configure it, no RST needed
+    }
+  } else if (rc522Ok) {
     rc522Ok = false;
     Serial.println("[rc522] reader lost");
   }
