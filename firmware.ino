@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.21"
+#define FW_VERSION "1.0.22"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -285,21 +285,16 @@ void startRC522() {
 
 // Hot-plug: detect an RC522 connected AFTER boot, and recover from cable glitches.
 void serviceReader() {
-  static byte missCount = 0;
   byte v = readReaderVersion();
   bool present = (v != 0x00 && v != 0xFF);
   if (present) {
-    missCount = 0;
     if (!rc522Ok) startRC522();           // reader (re)appeared -> initialize it
-  } else if (rc522Ok) {
-    // A single failed version read is almost always just a momentary brownout, NOT a
-    // real disconnect. Re-initialising on every glitch throws away the working reader
-    // and blocks reads. Only give up after several consecutive misses.
-    if (++missCount >= 4) {
-      rc522Ok = false;
-      missCount = 0;
-      Serial.println("[rc522] reader lost");
-    }
+  } else {
+    // This flaky HW-126 reader browns out and degrades within seconds. A failed version
+    // read means it needs refreshing - re-init RIGHT AWAY. Counter-intuitively, the
+    // frequent re-init is what keeps it able to read (1.0.20 read because of this;
+    // 1.0.21 "tolerated" the glitch, skipped the refresh, and went blind).
+    startRC522();
   }
 }
 
