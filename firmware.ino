@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.36"
+#define FW_VERSION "1.0.37"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -267,7 +267,20 @@ void startRC522() {
     mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x27 << 1), 0xFF); // GsNReg  (CW+Mod N-driver = max)
     mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x28 << 1), 0x3F); // CWGsPReg  (P-driver CW = max)
     mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x29 << 1), 0x3F); // ModGsPReg (P-driver Mod = max)
-    Serial.println("[rc522] ready (v0x" + String(v, HEX) + ") - max gain + max drive");
+    // Verify the config actually stuck. On a hot-swap the DB9 contacts can be bouncing at the
+    // instant we init, leaving a reader that answers on SPI (looks "detected") but is only
+    // half-configured and won't read tags - the intermittent "sometimes it doesn't work after
+    // I plug a reader in". If the write didn't take, do NOT mark it ready: leave rc522Ok false
+    // so serviceReader re-inits on the next check, and keeps retrying until the contact is
+    // solid and the config lands cleanly.
+    byte gsnBack = mfrc522.PCD_ReadRegister((MFRC522::PCD_Register)(0x27 << 1));
+    if (gsnBack != 0xFF) {
+      rc522Ok = false;
+      Serial.println("[rc522] init didn't stick (v0x" + String(v, HEX) +
+                     " GsN=0x" + String(gsnBack, HEX) + ") - retrying (reseat the reader/DB9)");
+    } else {
+      Serial.println("[rc522] ready (v0x" + String(v, HEX) + ") - max gain + max drive");
+    }
   } else {
     Serial.println("[rc522] NOT DETECTED (v0x" + String(v, HEX) + ") - heartbeat continues anyway");
   }
