@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.27"
+#define FW_VERSION "1.0.28"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -383,10 +383,25 @@ void pollRfid() {
       postTagEvent(currentUID, "present");
     }
     // same tag still sitting there -> just refresh lastSeenAt, no repeat "present"
-  } else if (currentUID != "" && millis() - lastSeenAt > REMOVE_TIMEOUT) {
-    Serial.println("Tag removed: " + currentUID);
-    postTagEvent(currentUID, "removed");
-    currentUID = "";
+  } else if (currentUID != "") {
+    // We were tracking a tag and suddenly can't read it. On these flaky readers that is
+    // almost always the reader wedging mid-session, NOT the tag actually leaving. The one
+    // thing that reliably recovers it is a full re-init (the "unplug/replug" the user does
+    // by hand). Do that automatically, throttled to READER_REFRESH_MS so we don't hammer
+    // SPI (over-re-init in 1.0.22-1.0.24 corrupted reads). This is the recover-after-dropout
+    // behaviour: keep re-initing while the tag should still be there, and only after
+    // REMOVE_TIMEOUT of no-see do we accept it as genuinely removed.
+    unsigned long now = millis();
+    if (now - lastReaderRefreshAt >= READER_REFRESH_MS) {
+      lastReaderRefreshAt = now;
+      Serial.println("[rc522] tag lost mid-session - re-initing reader to recover");
+      startRC522();
+    }
+    if (now - lastSeenAt > REMOVE_TIMEOUT) {
+      Serial.println("Tag removed: " + currentUID);
+      postTagEvent(currentUID, "removed");
+      currentUID = "";
+    }
   }
 }
 
