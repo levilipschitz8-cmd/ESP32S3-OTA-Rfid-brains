@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.10"
+#define FW_VERSION "1.0.11"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -257,13 +257,14 @@ void startRC522() {
   byte v = readReaderVersion();
   rc522Ok = (v != 0x00 && v != 0xFF);
   if (rc522Ok) {
-    mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_max);        // max receive sensitivity (48 dB)
+    // Standard, conservative RF config. A previous build forced antenna gain AND
+    // driver conductance to maximum. On several modules (HW-126 clones, and some
+    // boards even with a normal RC522) that saturates the receiver / detunes the
+    // field: the chip answers over SPI (so it looks "detected") but cannot actually
+    // read a tag. Library defaults read reliably, so we use a moderate gain here.
+    mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_avg);        // moderate receive gain (avoids saturation)
     mfrc522.PCD_AntennaOn();
-    // Drive the antenna as hard as the chip allows -> strongest field / best range.
-    mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x27 << 1), 0xFF); // GsNReg  (CW+Mod N-driver = max)
-    mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x28 << 1), 0x3F); // CWGsPReg  (P-driver CW = max)
-    mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x29 << 1), 0x3F); // ModGsPReg (P-driver Mod = max)
-    Serial.println("[rc522] ready (v0x" + String(v, HEX) + ") - max gain + max drive");
+    Serial.println("[rc522] ready (v0x" + String(v, HEX) + ") - default RF (moderate gain)");
   } else {
     Serial.println("[rc522] NOT DETECTED (v0x" + String(v, HEX) + ") - heartbeat continues anyway");
   }
