@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.30"
+#define FW_VERSION "1.0.31"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -386,25 +386,17 @@ void pollRfid() {
       postTagEvent(currentUID, "present");
     }
     // same tag still sitting there -> just refresh lastSeenAt, no repeat "present"
-  } else if (currentUID != "") {
-    // We were tracking a tag and suddenly can't read it. On these flaky readers that is
-    // almost always the reader wedging mid-session, NOT the tag actually leaving. The one
-    // thing that reliably recovers it is a full re-init (the "unplug/replug" the user does
-    // by hand). Do that automatically, throttled to READER_REFRESH_MS so we don't hammer
-    // SPI (over-re-init in 1.0.22-1.0.24 corrupted reads). This is the recover-after-dropout
-    // behaviour: keep re-initing while the tag should still be there, and only after
-    // REMOVE_TIMEOUT of no-see do we accept it as genuinely removed.
-    unsigned long now = millis();
-    if (now - lastReaderRefreshAt >= READER_REFRESH_MS) {
-      lastReaderRefreshAt = now;
-      Serial.println("[rc522] tag lost mid-session - re-initing reader to recover");
-      startRC522();
-    }
-    if (now - lastSeenAt > REMOVE_TIMEOUT) {
-      Serial.println("Tag removed: " + currentUID);
-      postTagEvent(currentUID, "removed");
-      currentUID = "";
-    }
+    // same tag still sitting there -> just refresh lastSeenAt, no repeat "present"
+  } else if (currentUID != "" && millis() - lastSeenAt > REMOVE_TIMEOUT) {
+    // A single missed read is normal and does NOT mean the reader wedged. With a clean
+    // power supply the readers are healthy, so we must NOT slam them with a full reset on
+    // every miss (1.0.28 did that every 700ms -> a reset knocked out the next read -> more
+    // resets -> the present/removed/reader-lost thrash). readTagUID() already re-forces the
+    // antenna gently each poll; that is all the recovery a healthy reader needs. Just wait
+    // out REMOVE_TIMEOUT of continuous no-see before accepting the tag as genuinely gone.
+    Serial.println("Tag removed: " + currentUID);
+    postTagEvent(currentUID, "removed");
+    currentUID = "";
   }
 }
 
