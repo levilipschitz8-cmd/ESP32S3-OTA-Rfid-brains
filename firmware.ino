@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.18"
+#define FW_VERSION "1.0.19"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -59,7 +59,9 @@ const unsigned long WIFI_CHECK_INTERVAL  = 5000;
 const unsigned long OTA_CHECK_INTERVAL   = 60000;    // 60s
 const unsigned long READER_CHECK_INTERVAL = 3000;    // hot-plug re-check
 const unsigned long OFFLINE_REBOOT_TIMEOUT = 60000;  // no server contact for 60s -> self-reboot
-const unsigned long REMOVE_TIMEOUT       = 1000;     // ~1s: report tag removed quickly (glitch-filtered)
+const unsigned long REMOVE_TIMEOUT       = 4000;     // 4s of continuous no-see before "removed".
+                                                     // These flaky boards drop the field intermittently;
+                                                     // a short timeout caused false present/removed flapping.
 
 void resolveIdentity() {
   prefs.begin("ident", false);
@@ -312,7 +314,7 @@ bool isTagStillPresent() {
   byte bufferSize;
   // Retry: on a long/noisy cable a single check can glitch even with the tag present.
   // Only if all attempts fail do we treat the tag as gone -> no false "removed".
-  for (int attempt = 0; attempt < 3; attempt++) {
+  for (int attempt = 0; attempt < 6; attempt++) {
     ensureAntennaOn();                       // reader drops the field between ops -> re-force
     mfrc522.PCD_WriteRegister(mfrc522.TxModeReg, 0x00);
     mfrc522.PCD_WriteRegister(mfrc522.RxModeReg, 0x00);
