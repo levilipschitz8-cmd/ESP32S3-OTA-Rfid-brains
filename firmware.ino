@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.19"
+#define FW_VERSION "1.0.20"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -326,35 +326,43 @@ bool isTagStillPresent() {
   return false;
 }
 
+// Read a tag UID this poll, or "" if none. Uses WakeupA (WUPA), which wakes BOTH fresh
+// (IDLE) and already-read (HALT) tags. PICC_IsNewCardPresent()/REQA does NOT wake a
+// halted tag, so after we read+halt a tag it could never be re-detected -> the reader
+// got stuck "removed" and never flicked back. WUPA fixes that. Re-force the flaky field
+// before each attempt.
+String readTagUID() {
+  for (int attempt = 0; attempt < 5; attempt++) {
+    ensureAntennaOn();
+    byte atqa[2];
+    byte size = sizeof(atqa);
+    MFRC522::StatusCode s = mfrc522.PICC_WakeupA(atqa, &size);
+    if ((s == MFRC522::STATUS_OK || s == MFRC522::STATUS_COLLISION) && mfrc522.PICC_ReadCardSerial()) {
+      String uid = uidToString(mfrc522.uid);
+      mfrc522.PICC_HaltA();
+      mfrc522.PCD_StopCrypto1();
+      return uid;
+    }
+  }
+  return "";
+}
+
 void pollRfid() {
   if (!rc522Ok) return;
-  if (currentUID != "") {
-    if (isTagStillPresent()) {
-      lastSeenAt = millis();
-    } else if (millis() - lastSeenAt > REMOVE_TIMEOUT) {
-      Serial.println("Tag removed: " + currentUID);
-      postTagEvent(currentUID, "removed");
-      currentUID = "";
-      // Do NOT PCD_Init() here. On these boards it wipes the antenna/gain/drive config,
-      // leaving the reader deaf to the next tag. The scan path re-forces the field via
-      // ensureAntennaOn(), and the gain/drive from startRC522() stays intact.
-    }
-    return;
-  }
-  // Retry a few times per scan: over a long cable a faint tag often fails the first
-  // attempt. This board drops the antenna after each op, so re-force it every attempt.
-  bool found = false;
-  for (int attempt = 0; attempt < 5 && !found; attempt++) {
-    ensureAntennaOn();
-    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) found = true;
-  }
-  if (found) {
-    currentUID = uidToString(mfrc522.uid);
+
+  String uid = readTagUID();
+  if (uid != "") {
     lastSeenAt = millis();
-    Serial.println("Tag present: " + currentUID);
-    postTagEvent(currentUID, "present");
-    mfrc522.PICC_HaltA();
-    mfrc522.PCD_StopCrypto1();
+    if (uid != currentUID) {              // first sighting of this tag -> announce once
+      currentUID = uid;
+      Serial.println("Tag present: " + currentUID);
+      postTagEvent(currentUID, "present");
+    }
+    // same tag still sitting there -> just refresh lastSeenAt, no repeat "present"
+  } else if (currentUID != "" && millis() - lastSeenAt > REMOVE_TIMEOUT) {
+    Serial.println("Tag removed: " + currentUID);
+    postTagEvent(currentUID, "removed");
+    currentUID = "";
   }
 }
 
