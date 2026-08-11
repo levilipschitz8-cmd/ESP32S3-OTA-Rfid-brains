@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.15"
+#define FW_VERSION "1.0.16"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -293,12 +293,29 @@ void serviceReader() {
   }
 }
 
+// These ESP32-S3 boards drop the RC522 antenna (TxControlReg RF-enable bits) back to
+// OFF after every RF operation, so the reader goes blind between ops (reads a tag, then
+// can't see it -> false "removed"). Force the field on before each and every op.
+void ensureAntennaOn() {
+  byte tx = mfrc522.PCD_ReadRegister(mfrc522.TxControlReg);
+  if ((tx & 0x03) == 0x03) return;                       // already on
+  mfrc522.PCD_WriteRegister(mfrc522.TxControlReg, tx | 0x03);
+  if ((mfrc522.PCD_ReadRegister(mfrc522.TxControlReg) & 0x03) == 0x03) return;  // stuck on
+  // Write refused -> reader wedged. Full reset recovery, then force on.
+  mfrc522.PCD_Reset();
+  delay(50);
+  mfrc522.PCD_Init();
+  mfrc522.PCD_AntennaOn();
+  mfrc522.PCD_WriteRegister(mfrc522.TxControlReg, 0x83);
+}
+
 bool isTagStillPresent() {
   byte bufferATQA[2];
   byte bufferSize;
   // Retry: on a long/noisy cable a single check can glitch even with the tag present.
   // Only if all attempts fail do we treat the tag as gone -> no false "removed".
   for (int attempt = 0; attempt < 3; attempt++) {
+    ensureAntennaOn();                       // reader drops the field between ops -> re-force
     mfrc522.PCD_WriteRegister(mfrc522.TxModeReg, 0x00);
     mfrc522.PCD_WriteRegister(mfrc522.RxModeReg, 0x00);
     mfrc522.PCD_WriteRegister(mfrc522.ModWidthReg, 0x26);
@@ -322,29 +339,12 @@ void pollRfid() {
     }
     return;
   }
-  // The antenna (TxControlReg Tx1/Tx2 RF-enable bits) is stuck OFF (0x80) on these
-  // boards: reader answers over SPI but never radiates. Force it on, read back to see
-  // if the write sticks; if not, the reader is wedged -> full reset + re-init + on.
-  byte txB = mfrc522.PCD_ReadRegister(mfrc522.TxControlReg);
-  mfrc522.PCD_WriteRegister(mfrc522.TxControlReg, txB | 0x03);
-  byte txW = mfrc522.PCD_ReadRegister(mfrc522.TxControlReg);
-  if ((txW & 0x03) != 0x03) {
-    mfrc522.PCD_Reset();
-    delay(50);
-    mfrc522.PCD_Init();
-    delay(20);
-    mfrc522.PCD_AntennaOn();
-    mfrc522.PCD_WriteRegister(mfrc522.TxControlReg, 0x83);
-    txW = mfrc522.PCD_ReadRegister(mfrc522.TxControlReg);
-  }
-
-  // Retry a few times per scan: over a long cable a faint tag often fails the first attempt.
+  // Retry a few times per scan: over a long cable a faint tag often fails the first
+  // attempt. This board drops the antenna after each op, so re-force it every attempt.
   bool found = false;
-  bool sawCard = false;
   for (int attempt = 0; attempt < 5 && !found; attempt++) {
-    bool present = mfrc522.PICC_IsNewCardPresent();
-    if (present) sawCard = true;
-    if (present && mfrc522.PICC_ReadCardSerial()) found = true;
+    ensureAntennaOn();
+    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) found = true;
   }
   if (found) {
     currentUID = uidToString(mfrc522.uid);
@@ -353,16 +353,6 @@ void pollRfid() {
     postTagEvent(currentUID, "present");
     mfrc522.PICC_HaltA();
     mfrc522.PCD_StopCrypto1();
-  } else {
-    // DIAGNOSTIC (once/sec): txB=before write, txW=after write/re-init, txS=after scan.
-    static unsigned long lastDiag = 0;
-    if (millis() - lastDiag > 1000) {
-      lastDiag = millis();
-      byte txS = mfrc522.PCD_ReadRegister(mfrc522.TxControlReg);
-      byte ver = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
-      Serial.printf("[diag] sawCard=%d txB=0x%02X txW=0x%02X txS=0x%02X ver=0x%02X\n",
-                    sawCard, txB, txW, txS, ver);
-    }
   }
 }
 
