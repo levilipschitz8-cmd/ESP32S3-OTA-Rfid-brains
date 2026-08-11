@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.33"
+#define FW_VERSION "1.0.34"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -45,12 +45,14 @@ bool firstBeat = true;
 bool wifiUp = false;
 bool everConnected = false;             // reached the server at least once this boot
 String currentUID = "";
+byte lastReaderVersion = 0;             // last RC522 version byte read (for the status line)
 unsigned long lastSeenAt = 0;
 unsigned long lastHeartbeatAt = 0;
 unsigned long lastRfidPollAt = 0;
 unsigned long lastWifiCheckAt = 0;
 unsigned long lastOtaAt = 0;
 unsigned long lastReaderCheckAt = 0;
+unsigned long lastStatusAt = 0;         // last time we printed the human status line
 unsigned long lastGoodContactAt = 0;   // last successful (200) heartbeat
 
 const unsigned long HEARTBEAT_INTERVAL   = 5000;
@@ -58,6 +60,7 @@ const unsigned long RFID_POLL_INTERVAL   = 250;
 const unsigned long WIFI_CHECK_INTERVAL  = 5000;
 const unsigned long OTA_CHECK_INTERVAL   = 60000;    // 60s
 const unsigned long READER_CHECK_INTERVAL = 3000;    // hot-plug re-check
+const unsigned long STATUS_INTERVAL      = 2000;     // print a clear per-board status line this often
 const unsigned long OFFLINE_REBOOT_TIMEOUT = 60000;  // no server contact for 60s -> self-reboot
 const unsigned long REMOVE_TIMEOUT       = 1000;     // ~1s: report tag removed quickly (glitch-filtered)
 
@@ -255,6 +258,7 @@ void startRC522() {
   mfrc522.PCD_Init();
   delay(50);
   byte v = readReaderVersion();
+  lastReaderVersion = v;
   rc522Ok = (v != 0x00 && v != 0xFF);
   if (rc522Ok) {
     mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_max);        // max receive sensitivity (48 dB)
@@ -272,6 +276,7 @@ void startRC522() {
 // Hot-plug: detect an RC522 connected AFTER boot, and recover from cable glitches.
 void serviceReader() {
   byte v = readReaderVersion();
+  lastReaderVersion = v;
   bool present = (v != 0x00 && v != 0xFF);
   if (present && !rc522Ok) {
     startRC522();                         // reader just appeared -> initialize it
@@ -279,6 +284,23 @@ void serviceReader() {
     rc522Ok = false;
     Serial.println("[rc522] reader lost");
   }
+}
+
+// A single, human-readable line printed a couple times a second so you can tell exactly
+// WHICH board you're looking at (its permanent MAC + board number) and whether its reader
+// harness is actually alive. Uses only cached values -> it does NOT touch the RF/read path.
+void printStatus() {
+  String reader = rc522Ok
+      ? ("OK  (v0x" + String(lastReaderVersion, HEX) + ")")
+      : ("FAULT - no reader (v0x" + String(lastReaderVersion, HEX) + ") - check DB9 wiring/3V3");
+  String tag  = (currentUID != "") ? currentUID : "-- none --";
+  String wifi = (WiFi.status() == WL_CONNECTED) ? ("up " + WiFi.localIP().toString()) : "DOWN";
+  Serial.println("[STATUS] board #" + String(boardNum) +
+                 "  code=" + (boardCode != "" ? boardCode : "(unset)") +
+                 "  MAC=" + WiFi.macAddress() +
+                 "  READER=" + reader +
+                 "  tag=" + tag +
+                 "  wifi=" + wifi);
 }
 
 bool isTagStillPresent() {
@@ -340,6 +362,7 @@ void setup() {
 
   Serial.println("========================================");
   Serial.println("FW " + String(FW_VERSION) + "  board #" + String(boardNum) + "  code=" + boardCode);
+  Serial.println(">>> THIS BOARD's PERMANENT ID (MAC): " + WiFi.macAddress() + " <<<");
   Serial.print("Connecting WiFi");
   unsigned long t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) { wifiMulti.run(); delay(20); }
@@ -409,5 +432,10 @@ void loop() {
   if (now - lastRfidPollAt >= RFID_POLL_INTERVAL) {
     lastRfidPollAt = now;
     pollRfid();
+  }
+
+  if (now - lastStatusAt >= STATUS_INTERVAL) {
+    lastStatusAt = now;
+    printStatus();
   }
 }
