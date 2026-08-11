@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.24"
+#define FW_VERSION "1.0.25"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -291,14 +291,11 @@ void startRC522() {
 void serviceReader() {
   byte v = readReaderVersion();
   bool present = (v != 0x00 && v != 0xFF);
-  if (present) {
-    if (!rc522Ok) startRC522();           // reader (re)appeared -> initialize it
-  } else {
-    // This flaky HW-126 reader browns out and degrades within seconds. A failed version
-    // read means it needs refreshing - re-init RIGHT AWAY. Counter-intuitively, the
-    // frequent re-init is what keeps it able to read (1.0.20 read because of this;
-    // 1.0.21 "tolerated" the glitch, skipped the refresh, and went blind).
-    startRC522();
+  if (present && !rc522Ok) {
+    startRC522();                         // reader (re)appeared -> initialize it
+  } else if (!present && rc522Ok) {
+    rc522Ok = false;
+    Serial.println("[rc522] reader lost");
   }
 }
 
@@ -370,20 +367,10 @@ void pollRfid() {
       postTagEvent(currentUID, "present");
     }
     // same tag still sitting there -> just refresh lastSeenAt, no repeat "present"
-  } else if (currentUID != "") {
-    // We HAD a tag but can't read it now. This reader degrades after reading and only
-    // recovers on a fresh init - which is exactly why physically re-plugging it makes it
-    // read again (the re-plug triggers startRC522). Do that re-init automatically
-    // (throttled) so it recovers on its own without anyone touching the hardware.
-    if (millis() - lastReaderRefreshAt > READER_REFRESH_MS) {
-      lastReaderRefreshAt = millis();
-      startRC522();
-    }
-    if (millis() - lastSeenAt > REMOVE_TIMEOUT) {
-      Serial.println("Tag removed: " + currentUID);
-      postTagEvent(currentUID, "removed");
-      currentUID = "";
-    }
+  } else if (currentUID != "" && millis() - lastSeenAt > REMOVE_TIMEOUT) {
+    Serial.println("Tag removed: " + currentUID);
+    postTagEvent(currentUID, "removed");
+    currentUID = "";
   }
 }
 
