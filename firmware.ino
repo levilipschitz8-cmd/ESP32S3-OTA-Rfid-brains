@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.13"
+#define FW_VERSION "1.0.14"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -322,6 +322,14 @@ void pollRfid() {
     }
     return;
   }
+  // FIX: diagnostics proved some ESP32-S3 boards come out of init with TxControlReg
+  // back at 0x80 (RF driver bits OFF) -> the reader answers over SPI (looks "detected")
+  // but never radiates a field, so it can never see a tag. PCD_AntennaOn() during init
+  // doesn't stick on these boards. Force the antenna hard-on before every scan.
+  byte tx = mfrc522.PCD_ReadRegister(mfrc522.TxControlReg);
+  if ((tx & 0x03) != 0x03)
+    mfrc522.PCD_WriteRegister(mfrc522.TxControlReg, tx | 0x03);  // set Tx1RFEn + Tx2RFEn
+
   // Retry a few times per scan: over a long cable a faint tag often fails the first attempt.
   bool found = false;
   bool sawCard = false;
