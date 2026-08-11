@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.14"
+#define FW_VERSION "1.0.15"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -322,13 +322,21 @@ void pollRfid() {
     }
     return;
   }
-  // FIX: diagnostics proved some ESP32-S3 boards come out of init with TxControlReg
-  // back at 0x80 (RF driver bits OFF) -> the reader answers over SPI (looks "detected")
-  // but never radiates a field, so it can never see a tag. PCD_AntennaOn() during init
-  // doesn't stick on these boards. Force the antenna hard-on before every scan.
-  byte tx = mfrc522.PCD_ReadRegister(mfrc522.TxControlReg);
-  if ((tx & 0x03) != 0x03)
-    mfrc522.PCD_WriteRegister(mfrc522.TxControlReg, tx | 0x03);  // set Tx1RFEn + Tx2RFEn
+  // The antenna (TxControlReg Tx1/Tx2 RF-enable bits) is stuck OFF (0x80) on these
+  // boards: reader answers over SPI but never radiates. Force it on, read back to see
+  // if the write sticks; if not, the reader is wedged -> full reset + re-init + on.
+  byte txB = mfrc522.PCD_ReadRegister(mfrc522.TxControlReg);
+  mfrc522.PCD_WriteRegister(mfrc522.TxControlReg, txB | 0x03);
+  byte txW = mfrc522.PCD_ReadRegister(mfrc522.TxControlReg);
+  if ((txW & 0x03) != 0x03) {
+    mfrc522.PCD_Reset();
+    delay(50);
+    mfrc522.PCD_Init();
+    delay(20);
+    mfrc522.PCD_AntennaOn();
+    mfrc522.PCD_WriteRegister(mfrc522.TxControlReg, 0x83);
+    txW = mfrc522.PCD_ReadRegister(mfrc522.TxControlReg);
+  }
 
   // Retry a few times per scan: over a long cable a faint tag often fails the first attempt.
   bool found = false;
@@ -346,14 +354,14 @@ void pollRfid() {
     mfrc522.PICC_HaltA();
     mfrc522.PCD_StopCrypto1();
   } else {
-    // DIAGNOSTIC (once/sec): show whether the reader's field sees a tag (sawCard)
-    // and whether the antenna is actually enabled (TxControlReg bits0-1 = Tx1/Tx2 RF on).
+    // DIAGNOSTIC (once/sec): txB=before write, txW=after write/re-init, txS=after scan.
     static unsigned long lastDiag = 0;
     if (millis() - lastDiag > 1000) {
       lastDiag = millis();
-      byte tx  = mfrc522.PCD_ReadRegister(mfrc522.TxControlReg);
+      byte txS = mfrc522.PCD_ReadRegister(mfrc522.TxControlReg);
       byte ver = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
-      Serial.printf("[diag] sawCard=%d TxControl=0x%02X ver=0x%02X\n", sawCard, tx, ver);
+      Serial.printf("[diag] sawCard=%d txB=0x%02X txW=0x%02X txS=0x%02X ver=0x%02X\n",
+                    sawCard, txB, txW, txS, ver);
     }
   }
 }
