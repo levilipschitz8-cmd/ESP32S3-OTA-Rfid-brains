@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.11"
+#define FW_VERSION "1.0.12"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -252,19 +252,30 @@ void startRC522() {
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
   SPI.setFrequency(50000);               // 50 kHz: maximum tolerance for very long (~3 m) cables
   for (byte i = 0; i < 6; i++) mifareKey.keyByte[i] = 0xFF;
+
+  // Explicit hardware reset pulse on RST. Some ESP32-S3 boards leave the RC522 in
+  // a half-initialised state where it answers over SPI (so it looks "detected")
+  // but its RF receiver never comes up -> the reader can't actually read a tag.
+  // A clean low->high pulse forces a full power-on reset before we init. This is
+  // the difference that makes one board read and an identically-wired one not.
+  pinMode(RST_PIN, OUTPUT);
+  digitalWrite(RST_PIN, LOW);
+  delay(10);
+  digitalWrite(RST_PIN, HIGH);
+  delay(50);
+
   mfrc522.PCD_Init();
   delay(50);
   byte v = readReaderVersion();
   rc522Ok = (v != 0x00 && v != 0xFF);
   if (rc522Ok) {
-    // Standard, conservative RF config. A previous build forced antenna gain AND
-    // driver conductance to maximum. On several modules (HW-126 clones, and some
-    // boards even with a normal RC522) that saturates the receiver / detunes the
-    // field: the chip answers over SPI (so it looks "detected") but cannot actually
-    // read a tag. Library defaults read reliably, so we use a moderate gain here.
-    mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_avg);        // moderate receive gain (avoids saturation)
+    mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_max);        // max receive sensitivity (48 dB) - proven on working board
     mfrc522.PCD_AntennaOn();
-    Serial.println("[rc522] ready (v0x" + String(v, HEX) + ") - default RF (moderate gain)");
+    // Restore the strong antenna drive that the working board reads with.
+    mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x27 << 1), 0xFF); // GsNReg  (CW+Mod N-driver = max)
+    mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x28 << 1), 0x3F); // CWGsPReg  (P-driver CW = max)
+    mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x29 << 1), 0x3F); // ModGsPReg (P-driver Mod = max)
+    Serial.println("[rc522] ready (v0x" + String(v, HEX) + ") - hw-reset + max RF");
   } else {
     Serial.println("[rc522] NOT DETECTED (v0x" + String(v, HEX) + ") - heartbeat continues anyway");
   }
