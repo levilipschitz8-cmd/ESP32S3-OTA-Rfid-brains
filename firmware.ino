@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.20"
+#define FW_VERSION "1.0.21"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -285,13 +285,21 @@ void startRC522() {
 
 // Hot-plug: detect an RC522 connected AFTER boot, and recover from cable glitches.
 void serviceReader() {
+  static byte missCount = 0;
   byte v = readReaderVersion();
   bool present = (v != 0x00 && v != 0xFF);
-  if (present && !rc522Ok) {
-    startRC522();                         // reader just appeared -> initialize it
-  } else if (!present && rc522Ok) {
-    rc522Ok = false;
-    Serial.println("[rc522] reader lost");
+  if (present) {
+    missCount = 0;
+    if (!rc522Ok) startRC522();           // reader (re)appeared -> initialize it
+  } else if (rc522Ok) {
+    // A single failed version read is almost always just a momentary brownout, NOT a
+    // real disconnect. Re-initialising on every glitch throws away the working reader
+    // and blocks reads. Only give up after several consecutive misses.
+    if (++missCount >= 4) {
+      rc522Ok = false;
+      missCount = 0;
+      Serial.println("[rc522] reader lost");
+    }
   }
 }
 
@@ -332,6 +340,13 @@ bool isTagStillPresent() {
 // got stuck "removed" and never flicked back. WUPA fixes that. Re-force the flaky field
 // before each attempt.
 String readTagUID() {
+  // If a tag was already present, a brownout can leave it stuck in a state that neither
+  // WUPA nor REQA wakes (only a physical re-seat cleared it). Briefly drop the field to
+  // force the tag to power-cycle back to a detectable state, then bring the field up.
+  if (currentUID != "") {
+    mfrc522.PCD_WriteRegister(mfrc522.TxControlReg, 0x80);   // RF off
+    delay(3);
+  }
   for (int attempt = 0; attempt < 5; attempt++) {
     ensureAntennaOn();
     byte atqa[2];
