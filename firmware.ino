@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.32"
+#define FW_VERSION "1.0.33"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -46,7 +46,6 @@ bool wifiUp = false;
 bool everConnected = false;             // reached the server at least once this boot
 String currentUID = "";
 unsigned long lastSeenAt = 0;
-unsigned long lastReaderRefreshAt = 0;  // last auto re-init while a tag was present but unreadable
 unsigned long lastHeartbeatAt = 0;
 unsigned long lastRfidPollAt = 0;
 unsigned long lastWifiCheckAt = 0;
@@ -60,12 +59,7 @@ const unsigned long WIFI_CHECK_INTERVAL  = 5000;
 const unsigned long OTA_CHECK_INTERVAL   = 60000;    // 60s
 const unsigned long READER_CHECK_INTERVAL = 3000;    // hot-plug re-check
 const unsigned long OFFLINE_REBOOT_TIMEOUT = 60000;  // no server contact for 60s -> self-reboot
-const unsigned long REMOVE_TIMEOUT       = 4000;     // 4s of continuous no-see before "removed".
-                                                     // These flaky boards drop the field intermittently;
-                                                     // a short timeout caused false present/removed flapping.
-const unsigned long READER_REFRESH_MS    = 700;      // while a tag is present but unreadable, auto re-init
-                                                     // the reader this often (mimics a physical re-plug,
-                                                     // which is what recovers this flaky reader).
+const unsigned long REMOVE_TIMEOUT       = 1000;     // ~1s: report tag removed quickly (glitch-filtered)
 
 void resolveIdentity() {
   prefs.begin("ident", false);
@@ -258,30 +252,18 @@ void startRC522() {
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
   SPI.setFrequency(50000);               // 50 kHz: maximum tolerance for very long (~3 m) cables
   for (byte i = 0; i < 6; i++) mifareKey.keyByte[i] = 0xFF;
-
-  // Explicit hardware reset pulse on RST. Some ESP32-S3 boards leave the RC522 in
-  // a half-initialised state where it answers over SPI (so it looks "detected")
-  // but its RF receiver never comes up -> the reader can't actually read a tag.
-  // A clean low->high pulse forces a full power-on reset before we init. This is
-  // the difference that makes one board read and an identically-wired one not.
-  pinMode(RST_PIN, OUTPUT);
-  digitalWrite(RST_PIN, LOW);
-  delay(10);
-  digitalWrite(RST_PIN, HIGH);
-  delay(50);
-
   mfrc522.PCD_Init();
   delay(50);
   byte v = readReaderVersion();
   rc522Ok = (v != 0x00 && v != 0xFF);
   if (rc522Ok) {
-    mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_max);        // max receive sensitivity (48 dB) - proven on working board
+    mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_max);        // max receive sensitivity (48 dB)
     mfrc522.PCD_AntennaOn();
-    // Restore the strong antenna drive that the working board reads with.
+    // Drive the antenna as hard as the chip allows -> strongest field / best range.
     mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x27 << 1), 0xFF); // GsNReg  (CW+Mod N-driver = max)
     mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x28 << 1), 0x3F); // CWGsPReg  (P-driver CW = max)
     mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x29 << 1), 0x3F); // ModGsPReg (P-driver Mod = max)
-    Serial.println("[rc522] ready (v0x" + String(v, HEX) + ") - hw-reset + max RF");
+    Serial.println("[rc522] ready (v0x" + String(v, HEX) + ") - max gain + max drive");
   } else {
     Serial.println("[rc522] NOT DETECTED (v0x" + String(v, HEX) + ") - heartbeat continues anyway");
   }
@@ -292,31 +274,11 @@ void serviceReader() {
   byte v = readReaderVersion();
   bool present = (v != 0x00 && v != 0xFF);
   if (present && !rc522Ok) {
-    startRC522();                         // reader (re)appeared -> initialize it
+    startRC522();                         // reader just appeared -> initialize it
   } else if (!present && rc522Ok) {
     rc522Ok = false;
     Serial.println("[rc522] reader lost");
   }
-}
-
-// These ESP32-S3 boards drop the RC522 antenna (TxControlReg RF-enable bits) back to
-// OFF after every RF operation, so the reader goes blind between ops (reads a tag, then
-// can't see it -> false "removed"). Force the field on before each and every op.
-void ensureAntennaOn() {
-  byte tx = mfrc522.PCD_ReadRegister(mfrc522.TxControlReg);
-  if ((tx & 0x03) == 0x03) return;                       // already on
-  mfrc522.PCD_WriteRegister(mfrc522.TxControlReg, tx | 0x03);
-  if ((mfrc522.PCD_ReadRegister(mfrc522.TxControlReg) & 0x03) != 0x03) {
-    // The antenna-enable write did NOT stick -> the reader/antenna is wedged. A full
-    // reset + re-init un-wedges it. THIS is the step that actually made these readers
-    // read; removing it in v1.0.18 is exactly when they stopped. Restored.
-    mfrc522.PCD_Reset();
-    delay(50);
-    mfrc522.PCD_Init();
-    mfrc522.PCD_AntennaOn();
-    mfrc522.PCD_WriteRegister(mfrc522.TxControlReg, 0x83);
-  }
-  delay(8);   // let the field build + the tag power up before we transceive
 }
 
 bool isTagStillPresent() {
@@ -324,8 +286,7 @@ bool isTagStillPresent() {
   byte bufferSize;
   // Retry: on a long/noisy cable a single check can glitch even with the tag present.
   // Only if all attempts fail do we treat the tag as gone -> no false "removed".
-  for (int attempt = 0; attempt < 6; attempt++) {
-    ensureAntennaOn();                       // reader drops the field between ops -> re-force
+  for (int attempt = 0; attempt < 3; attempt++) {
     mfrc522.PCD_WriteRegister(mfrc522.TxModeReg, 0x00);
     mfrc522.PCD_WriteRegister(mfrc522.RxModeReg, 0x00);
     mfrc522.PCD_WriteRegister(mfrc522.ModWidthReg, 0x26);
@@ -336,47 +297,31 @@ bool isTagStillPresent() {
   return false;
 }
 
-// Read a tag UID this poll, or "" if none. Uses WakeupA (WUPA), which wakes BOTH fresh
-// (IDLE) and already-read (HALT) tags. PICC_IsNewCardPresent()/REQA does NOT wake a
-// halted tag, so after we read+halt a tag it could never be re-detected -> the reader
-// got stuck "removed" and never flicked back. WUPA fixes that. Re-force the flaky field
-// before each attempt.
-String readTagUID() {
-  // Same read path whether or not a tag is already being tracked. (An earlier version
-  // did an extra field-off/on step when a tag was present; this flaky reader choked on
-  // it, so a tracked tag could never be re-read - only a fresh detection worked, which
-  // is why swapping readers and back "fixed" it. Keep it uniform.)
-  for (int attempt = 0; attempt < 5; attempt++) {
-    ensureAntennaOn();
-    byte atqa[2];
-    byte size = sizeof(atqa);
-    MFRC522::StatusCode s = mfrc522.PICC_WakeupA(atqa, &size);
-    if ((s == MFRC522::STATUS_OK || s == MFRC522::STATUS_COLLISION) && mfrc522.PICC_ReadCardSerial()) {
-      String uid = uidToString(mfrc522.uid);
-      mfrc522.PICC_HaltA();
-      mfrc522.PCD_StopCrypto1();
-      return uid;
-    }
-  }
-  return "";
-}
-
 void pollRfid() {
   if (!rc522Ok) return;
-
-  String uid = readTagUID();
-  if (uid != "") {
-    lastSeenAt = millis();
-    if (uid != currentUID) {              // first sighting of this tag -> announce once
-      currentUID = uid;
-      Serial.println("Tag present: " + currentUID);
-      postTagEvent(currentUID, "present");
+  if (currentUID != "") {
+    if (isTagStillPresent()) {
+      lastSeenAt = millis();
+    } else if (millis() - lastSeenAt > REMOVE_TIMEOUT) {
+      Serial.println("Tag removed: " + currentUID);
+      postTagEvent(currentUID, "removed");
+      currentUID = "";
+      mfrc522.PCD_Init();
     }
-    // same tag still sitting there -> just refresh lastSeenAt, no repeat "present"
-  } else if (currentUID != "" && millis() - lastSeenAt > REMOVE_TIMEOUT) {
-    Serial.println("Tag removed: " + currentUID);
-    postTagEvent(currentUID, "removed");
-    currentUID = "";
+    return;
+  }
+  // Retry a few times per scan: over a long cable a faint tag often fails the first attempt.
+  bool found = false;
+  for (int attempt = 0; attempt < 5 && !found; attempt++) {
+    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) found = true;
+  }
+  if (found) {
+    currentUID = uidToString(mfrc522.uid);
+    lastSeenAt = millis();
+    Serial.println("Tag present: " + currentUID);
+    postTagEvent(currentUID, "present");
+    mfrc522.PICC_HaltA();
+    mfrc522.PCD_StopCrypto1();
   }
 }
 
