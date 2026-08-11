@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.12"
+#define FW_VERSION "1.0.13"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -324,8 +324,11 @@ void pollRfid() {
   }
   // Retry a few times per scan: over a long cable a faint tag often fails the first attempt.
   bool found = false;
+  bool sawCard = false;
   for (int attempt = 0; attempt < 5 && !found; attempt++) {
-    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) found = true;
+    bool present = mfrc522.PICC_IsNewCardPresent();
+    if (present) sawCard = true;
+    if (present && mfrc522.PICC_ReadCardSerial()) found = true;
   }
   if (found) {
     currentUID = uidToString(mfrc522.uid);
@@ -334,6 +337,16 @@ void pollRfid() {
     postTagEvent(currentUID, "present");
     mfrc522.PICC_HaltA();
     mfrc522.PCD_StopCrypto1();
+  } else {
+    // DIAGNOSTIC (once/sec): show whether the reader's field sees a tag (sawCard)
+    // and whether the antenna is actually enabled (TxControlReg bits0-1 = Tx1/Tx2 RF on).
+    static unsigned long lastDiag = 0;
+    if (millis() - lastDiag > 1000) {
+      lastDiag = millis();
+      byte tx  = mfrc522.PCD_ReadRegister(mfrc522.TxControlReg);
+      byte ver = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
+      Serial.printf("[diag] sawCard=%d TxControl=0x%02X ver=0x%02X\n", sawCard, tx, ver);
+    }
   }
 }
 
