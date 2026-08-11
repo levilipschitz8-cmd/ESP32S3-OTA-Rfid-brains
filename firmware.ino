@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.34"
+#define FW_VERSION "1.0.35"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -332,10 +332,23 @@ void pollRfid() {
     }
     return;
   }
+  // Detect a tag with WakeupA (WUPA, 0x52) - NOT PICC_IsNewCardPresent/REQA (0x26).
+  // REQA only answers a tag that has JUST entered the field (IDLE state). A tag already
+  // sitting on the reader, or one the reader previously halted, ignores REQA -> you would
+  // only ever get "present" after physically removing + replacing the tag, or resetting the
+  // board with it in place (and even then only sometimes). WUPA wakes those tags too, so a
+  // tag that is already there registers as present immediately.
   // Retry a few times per scan: over a long cable a faint tag often fails the first attempt.
   bool found = false;
   for (int attempt = 0; attempt < 5 && !found; attempt++) {
-    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) found = true;
+    byte atqa[2];
+    byte atqaSize = sizeof(atqa);
+    mfrc522.PCD_WriteRegister(mfrc522.TxModeReg, 0x00);
+    mfrc522.PCD_WriteRegister(mfrc522.RxModeReg, 0x00);
+    mfrc522.PCD_WriteRegister(mfrc522.ModWidthReg, 0x26);
+    MFRC522::StatusCode s = mfrc522.PICC_WakeupA(atqa, &atqaSize);
+    if ((s == MFRC522::STATUS_OK || s == MFRC522::STATUS_COLLISION) && mfrc522.PICC_ReadCardSerial())
+      found = true;
   }
   if (found) {
     currentUID = uidToString(mfrc522.uid);
