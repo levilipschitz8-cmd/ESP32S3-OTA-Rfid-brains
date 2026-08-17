@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.38"
+#define FW_VERSION "1.0.39"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -332,12 +332,36 @@ void printStatus() {
                  "  wifi=" + wifi);
 }
 
+// Force the RC522 RF field ON. These ESP32-S3 setups drop the antenna-enable bits
+// (TxControlReg -> 0x80) after operations, so over a long run the field goes down and a
+// perfectly good reader goes blind -> "it read fine then stopped". Re-assert the field
+// before every read. If the enable write does NOT stick, the reader's RF stage has wedged
+// and only a full reset clears it, so do that and re-apply our config. This is the piece
+// that keeps these readers reading indefinitely.
+void ensureAntennaOn() {
+  byte tx = mfrc522.PCD_ReadRegister(mfrc522.TxControlReg);
+  if ((tx & 0x03) == 0x03) return;                        // field already on
+  mfrc522.PCD_WriteRegister(mfrc522.TxControlReg, tx | 0x03);
+  if ((mfrc522.PCD_ReadRegister(mfrc522.TxControlReg) & 0x03) != 0x03) {
+    mfrc522.PCD_Reset();
+    delay(50);
+    mfrc522.PCD_Init();
+    mfrc522.PCD_AntennaOn();
+    mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_max);
+    mfrc522.PCD_WriteRegister(mfrc522.TxControlReg, 0x83);
+    mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x27 << 1), 0xFF); // GsNReg   max drive
+    mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x28 << 1), 0x3F); // CWGsPReg  max drive
+    mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x29 << 1), 0x3F); // ModGsPReg max drive
+  }
+}
+
 bool isTagStillPresent() {
   byte bufferATQA[2];
   byte bufferSize;
   // Retry: on a long/noisy cable a single check can glitch even with the tag present.
   // Only if all attempts fail do we treat the tag as gone -> no false "removed".
   for (int attempt = 0; attempt < 3; attempt++) {
+    ensureAntennaOn();                     // keep the field up so the reader doesn't go blind
     mfrc522.PCD_WriteRegister(mfrc522.TxModeReg, 0x00);
     mfrc522.PCD_WriteRegister(mfrc522.RxModeReg, 0x00);
     mfrc522.PCD_WriteRegister(mfrc522.ModWidthReg, 0x26);
@@ -382,6 +406,7 @@ void pollRfid() {
   // Retry a few times per scan: over a long cable a faint tag often fails the first attempt.
   bool found = false;
   for (int attempt = 0; attempt < 5 && !found; attempt++) {
+    ensureAntennaOn();                     // keep the field up so a tag can actually be seen
     byte atqa[2];
     byte atqaSize = sizeof(atqa);
     mfrc522.PCD_WriteRegister(mfrc522.TxModeReg, 0x00);
