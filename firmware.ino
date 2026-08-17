@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.43"
+#define FW_VERSION "1.0.45"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -255,6 +255,14 @@ void startRC522() {
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
   SPI.setFrequency(50000);               // 50 kHz: maximum tolerance for very long (~3 m) cables
   for (byte i = 0; i < 6; i++) mifareKey.keyByte[i] = 0xFF;
+  // Hardware reset pulse on RST before init. A reader that has WEDGED (locked up, reads v0x0)
+  // is un-stuck far more reliably by a real power-on reset than by a soft init - this is what
+  // lets a wedged reader recover on re-init instead of staying dead until a manual replug.
+  pinMode(RST_PIN, OUTPUT);
+  digitalWrite(RST_PIN, LOW);
+  delay(10);
+  digitalWrite(RST_PIN, HIGH);
+  delay(50);
   mfrc522.PCD_Init();
   delay(50);
   byte v = readReaderVersion();
@@ -286,12 +294,14 @@ void startRC522() {
   }
 }
 
-// Hot-plug: detect an RC522 connected AFTER boot, and recover from cable glitches.
+// Hot-plug + recovery: detect a reader connected after boot, AND recover one that wedges.
 void serviceReader() {
+  static byte missCount = 0;
   byte v = readReaderVersion();
   lastReaderVersion = v;
   bool present = (v != 0x00 && v != 0xFF);
   if (present) {
+    missCount = 0;
     // Re-init when either (a) we don't think a reader is up, or (b) a reader IS present but
     // is NOT carrying our configuration. Case (b) is the HOT-SWAP fix: if you pull one reader
     // and plug another in between version checks, rc522Ok never goes false, so the new reader
@@ -302,9 +312,20 @@ void serviceReader() {
     if (!rc522Ok || gsn != 0xFF) {
       startRC522();                       // new/uninitialised reader -> configure it, no RST needed
     }
-  } else if (rc522Ok) {
-    rc522Ok = false;
-    Serial.println("[rc522] reader lost");
+  } else {
+    // Reader answered with nothing (v0x0). One glitch is normal on a long cable, so wait for a
+    // couple of consecutive misses before acting (never disturb a working reader over one blip).
+    // Then actively RE-INIT to recover a reader that has wedged in place - the old code only
+    // recovered a reader that came back on its own, so one stuck reading v0x0 stayed dead until
+    // a manual reset (exactly "tag presence randomly goes down and stays down"). The RST pulse
+    // in startRC522 un-sticks it, so it recovers by itself.
+    if (++missCount >= 2) {
+      if (rc522Ok) {
+        rc522Ok = false;
+        Serial.println("[rc522] reader lost - attempting recovery");
+      }
+      startRC522();
+    }
   }
 }
 
@@ -352,7 +373,17 @@ bool isTagStillPresent() {
 }
 
 void pollRfid() {
-  if (!rc522Ok) return;
+  if (!rc522Ok) {
+    // Reader is down (wedged/lost). If a tag was being tracked, clear it after the timeout so
+    // it doesn't stay stuck "present" while the reader is dead - serviceReader is re-initing
+    // the reader in the background to bring it back.
+    if (currentUID != "" && millis() - lastSeenAt > REMOVE_TIMEOUT) {
+      Serial.println("Tag removed: " + currentUID + " (reader down)");
+      postTagEvent(currentUID, "removed");
+      currentUID = "";
+    }
+    return;
+  }
   if (currentUID != "") {
     if (isTagStillPresent()) {
       lastSeenAt = millis();
