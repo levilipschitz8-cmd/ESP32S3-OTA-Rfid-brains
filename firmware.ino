@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.40"
+#define FW_VERSION "1.0.41"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -328,15 +328,25 @@ void printStatus() {
 bool isTagStillPresent() {
   byte bufferATQA[2];
   byte bufferSize;
-  // Retry: on a long/noisy cable a single check can glitch even with the tag present.
-  // Only if all attempts fail do we treat the tag as gone -> no false "removed".
+  // Genuinely RE-READ the tag's UID each time and confirm it still matches the one we're
+  // tracking. The old check only did a WakeupA - a bare "is anything in the field?" ping -
+  // which keeps returning OK even after the reader can no longer actually read the card. That
+  // made a real read go STALE: stuck "present" showing the last-good UID, never re-checked,
+  // until the tag was physically pulled. Requiring a full read that returns the SAME UID means
+  // "present" always reflects a fresh, real read; if we can't re-read that UID, the tag is gone.
   for (int attempt = 0; attempt < 3; attempt++) {
     mfrc522.PCD_WriteRegister(mfrc522.TxModeReg, 0x00);
     mfrc522.PCD_WriteRegister(mfrc522.RxModeReg, 0x00);
     mfrc522.PCD_WriteRegister(mfrc522.ModWidthReg, 0x26);
     bufferSize = sizeof(bufferATQA);
     MFRC522::StatusCode result = mfrc522.PICC_WakeupA(bufferATQA, &bufferSize);
-    if (result == MFRC522::STATUS_OK || result == MFRC522::STATUS_COLLISION) return true;
+    if ((result == MFRC522::STATUS_OK || result == MFRC522::STATUS_COLLISION) &&
+        mfrc522.PICC_ReadCardSerial()) {
+      String u = uidToString(mfrc522.uid);
+      mfrc522.PICC_HaltA();
+      mfrc522.PCD_StopCrypto1();
+      if (u == currentUID) return true;    // actually re-read the SAME tag -> genuinely still there
+    }
   }
   return false;
 }
