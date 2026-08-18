@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.51"
+#define FW_VERSION "1.0.52"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -64,7 +64,11 @@ const unsigned long READER_CHECK_INTERVAL = 3000;    // hot-plug re-check
 const unsigned long STATUS_INTERVAL      = 2000;     // print a clear per-board status line this often
 const unsigned long CLOSE_PROBE_INTERVAL = 1000;     // how often (max) to dip to low power for a close tag
 const unsigned long OFFLINE_REBOOT_TIMEOUT = 60000;  // no server contact for 60s -> self-reboot
-const unsigned long REMOVE_TIMEOUT       = 1000;     // ~1s: report tag removed quickly (glitch-filtered)
+const unsigned long REMOVE_TIMEOUT       = 3500;     // ~3.5s of continuous no-see before "removed".
+                                                     // A sitting tag near the edge of range can fail a
+                                                     // strict re-read for a moment; a short timeout turned
+                                                     // that into a false "removed". 3.5s rides through the
+                                                     // brief misses; a genuinely removed tag still clears.
 
 void resolveIdentity() {
   prefs.begin("ident", false);
@@ -376,11 +380,12 @@ String tryReadOnce() {
 
 bool isTagStillPresent() {
   // Re-read the tag's UID and confirm it matches the one we're tracking (so "present" never goes
-  // stale). FULL POWER first, 3 tries - the field stays at the steady 0xFF from startRC522, NOT
-  // rewritten, so a DISTANCE tag re-reads here with its field undisturbed. Only if full power
-  // fails do we do ONE brief low-power dip to catch a CLOSE/over-coupled tag, then snap the field
-  // straight back to full. A far tag never triggers the dip -> its read is never disturbed.
-  for (int attempt = 0; attempt < 3; attempt++) {
+  // stale). FULL POWER first, 5 tries - the field stays at the steady 0xFF from startRC522, NOT
+  // rewritten, so a DISTANCE tag re-reads here with its field undisturbed. More tries gives a
+  // tag near the edge of range extra chances to be re-read before we fall back, cutting false
+  // misses. Only if full power fails all 5 do we do ONE brief low-power dip to catch a CLOSE/
+  // over-coupled tag, then snap the field straight back to full. A far tag never triggers the dip.
+  for (int attempt = 0; attempt < 5; attempt++) {
     if (tryReadOnce() == currentUID) return true;
   }
   setAntennaDrive(0x44, 0x10, 0x10);           // brief low-power dip for a close tag
