@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.45"
+#define FW_VERSION "1.0.47"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -346,30 +346,52 @@ void printStatus() {
                  "  wifi=" + wifi);
 }
 
-bool isTagStillPresent() {
-  byte bufferATQA[2];
-  byte bufferSize;
-  // Genuinely RE-READ the tag's UID each time and confirm it still matches the one we're
-  // tracking. The old check only did a WakeupA - a bare "is anything in the field?" ping -
-  // which keeps returning OK even after the reader can no longer actually read the card. That
-  // made a real read go STALE: stuck "present" showing the last-good UID, never re-checked,
-  // until the tag was physically pulled. Requiring a full read that returns the SAME UID means
-  // "present" always reflects a fresh, real read; if we can't re-read that UID, the tag is gone.
-  for (int attempt = 0; attempt < 3; attempt++) {
-    mfrc522.PCD_WriteRegister(mfrc522.TxModeReg, 0x00);
-    mfrc522.PCD_WriteRegister(mfrc522.RxModeReg, 0x00);
-    mfrc522.PCD_WriteRegister(mfrc522.ModWidthReg, 0x26);
-    bufferSize = sizeof(bufferATQA);
-    MFRC522::StatusCode result = mfrc522.PICC_WakeupA(bufferATQA, &bufferSize);
-    if ((result == MFRC522::STATUS_OK || result == MFRC522::STATUS_COLLISION) &&
-        mfrc522.PICC_ReadCardSerial()) {
-      String u = uidToString(mfrc522.uid);
-      mfrc522.PICC_HaltA();
-      mfrc522.PCD_StopCrypto1();
-      if (u == currentUID) return true;    // actually re-read the SAME tag -> genuinely still there
-    }
+// Antenna drive levels, strongest -> weakest. Level 0 is full power (max range). A STRONG
+// reader over-couples when the tag is close (dead spot at the surface, "needs distance to
+// read"); a weaker field fixes that. Sweeping full->low until a tag reads means it reads at
+// any distance - far tags read at full power, close/over-coupled tags read at a lower level.
+static const byte DRIVE_LEVELS[][3] = {
+  { 0xFF, 0x3F, 0x3F },   // full power  - normal / longer range (what the fleet used before)
+  { 0x88, 0x20, 0x20 },   // stock default - medium
+  { 0x44, 0x10, 0x10 },   // low         - for a tag close enough to over-couple at full power
+};
+const int NUM_DRIVE_LEVELS = sizeof(DRIVE_LEVELS) / sizeof(DRIVE_LEVELS[0]);
+
+void setAntennaDrive(byte gsn, byte cwgsp, byte modgsp) {
+  mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x27 << 1), gsn);    // GsNReg
+  mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x28 << 1), cwgsp);  // CWGsPReg
+  mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x29 << 1), modgsp); // ModGsPReg
+}
+
+// One read attempt at the current settings. Returns the tag UID, or "" if nothing read.
+String tryReadOnce() {
+  byte atqa[2];
+  byte atqaSize = sizeof(atqa);
+  mfrc522.PCD_WriteRegister(mfrc522.TxModeReg, 0x00);
+  mfrc522.PCD_WriteRegister(mfrc522.RxModeReg, 0x00);
+  mfrc522.PCD_WriteRegister(mfrc522.ModWidthReg, 0x26);
+  MFRC522::StatusCode s = mfrc522.PICC_WakeupA(atqa, &atqaSize);
+  if ((s == MFRC522::STATUS_OK || s == MFRC522::STATUS_COLLISION) && mfrc522.PICC_ReadCardSerial()) {
+    String u = uidToString(mfrc522.uid);
+    mfrc522.PICC_HaltA();
+    mfrc522.PCD_StopCrypto1();
+    return u;
   }
-  return false;
+  return "";
+}
+
+bool isTagStillPresent() {
+  // Genuinely RE-READ the tag's UID and confirm it matches the one we're tracking (a bare
+  // WakeupA keeps saying OK after the reader can't really read, which made "present" go stale).
+  // Sweep the drive levels so it re-reads whether the tag is at a normal distance or close;
+  // restore full power after so the reader-health marker (GsN=0xFF) stays intact.
+  bool present = false;
+  for (int lvl = 0; lvl < NUM_DRIVE_LEVELS && !present; lvl++) {
+    setAntennaDrive(DRIVE_LEVELS[lvl][0], DRIVE_LEVELS[lvl][1], DRIVE_LEVELS[lvl][2]);
+    if (tryReadOnce() == currentUID) present = true;    // re-read the SAME tag -> still there
+  }
+  setAntennaDrive(0xFF, 0x3F, 0x3F);
+  return present;
 }
 
 void pollRfid() {
@@ -401,25 +423,22 @@ void pollRfid() {
   // only ever get "present" after physically removing + replacing the tag, or resetting the
   // board with it in place (and even then only sometimes). WUPA wakes those tags too, so a
   // tag that is already there registers as present immediately.
-  // Retry a few times per scan: over a long cable a faint tag often fails the first attempt.
-  bool found = false;
-  for (int attempt = 0; attempt < 5 && !found; attempt++) {
-    byte atqa[2];
-    byte atqaSize = sizeof(atqa);
-    mfrc522.PCD_WriteRegister(mfrc522.TxModeReg, 0x00);
-    mfrc522.PCD_WriteRegister(mfrc522.RxModeReg, 0x00);
-    mfrc522.PCD_WriteRegister(mfrc522.ModWidthReg, 0x26);
-    MFRC522::StatusCode s = mfrc522.PICC_WakeupA(atqa, &atqaSize);
-    if ((s == MFRC522::STATUS_OK || s == MFRC522::STATUS_COLLISION) && mfrc522.PICC_ReadCardSerial())
-      found = true;
+  // Sweep the antenna power full -> low until a tag reads. Full power first, so a normal/far
+  // tag reads immediately and nothing changes for readers that already work; only if full power
+  // finds nothing do we step down, which catches a tag close enough to over-couple a strong
+  // reader at full power. Restore full power afterwards so the reader-health marker (GsN=0xFF)
+  // is unaffected. Two tries per level for a faint tag.
+  String uid = "";
+  for (int lvl = 0; lvl < NUM_DRIVE_LEVELS && uid == ""; lvl++) {
+    setAntennaDrive(DRIVE_LEVELS[lvl][0], DRIVE_LEVELS[lvl][1], DRIVE_LEVELS[lvl][2]);
+    for (int attempt = 0; attempt < 2 && uid == ""; attempt++) uid = tryReadOnce();
   }
-  if (found) {
-    currentUID = uidToString(mfrc522.uid);
+  setAntennaDrive(0xFF, 0x3F, 0x3F);
+  if (uid != "") {
+    currentUID = uid;
     lastSeenAt = millis();
     Serial.println("Tag present: " + currentUID);
     postTagEvent(currentUID, "present");
-    mfrc522.PICC_HaltA();
-    mfrc522.PCD_StopCrypto1();
   }
 }
 
