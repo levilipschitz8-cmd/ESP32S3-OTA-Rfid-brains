@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.48"
+#define FW_VERSION "1.0.50"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -53,6 +53,7 @@ unsigned long lastWifiCheckAt = 0;
 unsigned long lastOtaAt = 0;
 unsigned long lastReaderCheckAt = 0;
 unsigned long lastStatusAt = 0;         // last time we printed the human status line
+unsigned long lastCloseProbeAt = 0;     // last low-power "close tag" probe while searching
 unsigned long lastGoodContactAt = 0;   // last successful (200) heartbeat
 
 const unsigned long HEARTBEAT_INTERVAL   = 5000;
@@ -61,6 +62,7 @@ const unsigned long WIFI_CHECK_INTERVAL  = 5000;
 const unsigned long OTA_CHECK_INTERVAL   = 60000;    // 60s
 const unsigned long READER_CHECK_INTERVAL = 3000;    // hot-plug re-check
 const unsigned long STATUS_INTERVAL      = 2000;     // print a clear per-board status line this often
+const unsigned long CLOSE_PROBE_INTERVAL = 1000;     // how often (max) to dip to low power for a close tag
 const unsigned long OFFLINE_REBOOT_TIMEOUT = 60000;  // no server contact for 60s -> self-reboot
 const unsigned long REMOVE_TIMEOUT       = 1000;     // ~1s: report tag removed quickly (glitch-filtered)
 
@@ -346,30 +348,45 @@ void printStatus() {
                  "  wifi=" + wifi);
 }
 
-bool isTagStillPresent() {
-  byte bufferATQA[2];
-  byte bufferSize;
-  // Genuinely RE-READ the tag's UID each time and confirm it still matches the one we're
-  // tracking. The old check only did a WakeupA - a bare "is anything in the field?" ping -
-  // which keeps returning OK even after the reader can no longer actually read the card. That
-  // made a real read go STALE: stuck "present" showing the last-good UID, never re-checked,
-  // until the tag was physically pulled. Requiring a full read that returns the SAME UID means
-  // "present" always reflects a fresh, real read; if we can't re-read that UID, the tag is gone.
-  for (int attempt = 0; attempt < 3; attempt++) {
-    mfrc522.PCD_WriteRegister(mfrc522.TxModeReg, 0x00);
-    mfrc522.PCD_WriteRegister(mfrc522.RxModeReg, 0x00);
-    mfrc522.PCD_WriteRegister(mfrc522.ModWidthReg, 0x26);
-    bufferSize = sizeof(bufferATQA);
-    MFRC522::StatusCode result = mfrc522.PICC_WakeupA(bufferATQA, &bufferSize);
-    if ((result == MFRC522::STATUS_OK || result == MFRC522::STATUS_COLLISION) &&
-        mfrc522.PICC_ReadCardSerial()) {
-      String u = uidToString(mfrc522.uid);
-      mfrc522.PICC_HaltA();
-      mfrc522.PCD_StopCrypto1();
-      if (u == currentUID) return true;    // actually re-read the SAME tag -> genuinely still there
-    }
+// Set the antenna P/N driver strength (field power). Only the low-power "close tag" probe
+// changes this; normal reads leave it at the full 0xFF set in startRC522.
+void setAntennaDrive(byte gsn, byte cwgsp, byte modgsp) {
+  mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x27 << 1), gsn);    // GsNReg
+  mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x28 << 1), cwgsp);  // CWGsPReg
+  mfrc522.PCD_WriteRegister((MFRC522::PCD_Register)(0x29 << 1), modgsp); // ModGsPReg
+}
+
+// One read attempt at the CURRENT power. Returns the tag UID, or "" if nothing read. Does not
+// touch the drive registers, so at full power the steady field a distance read needs is untouched.
+String tryReadOnce() {
+  byte atqa[2];
+  byte atqaSize = sizeof(atqa);
+  mfrc522.PCD_WriteRegister(mfrc522.TxModeReg, 0x00);
+  mfrc522.PCD_WriteRegister(mfrc522.RxModeReg, 0x00);
+  mfrc522.PCD_WriteRegister(mfrc522.ModWidthReg, 0x26);
+  MFRC522::StatusCode s = mfrc522.PICC_WakeupA(atqa, &atqaSize);
+  if ((s == MFRC522::STATUS_OK || s == MFRC522::STATUS_COLLISION) && mfrc522.PICC_ReadCardSerial()) {
+    String u = uidToString(mfrc522.uid);
+    mfrc522.PICC_HaltA();
+    mfrc522.PCD_StopCrypto1();
+    return u;
   }
-  return false;
+  return "";
+}
+
+bool isTagStillPresent() {
+  // Re-read the tag's UID and confirm it matches the one we're tracking (so "present" never goes
+  // stale). FULL POWER first, 3 tries - the field stays at the steady 0xFF from startRC522, NOT
+  // rewritten, so a DISTANCE tag re-reads here with its field undisturbed. Only if full power
+  // fails do we do ONE brief low-power dip to catch a CLOSE/over-coupled tag, then snap the field
+  // straight back to full. A far tag never triggers the dip -> its read is never disturbed.
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (tryReadOnce() == currentUID) return true;
+  }
+  setAntennaDrive(0x44, 0x10, 0x10);           // brief low-power dip for a close tag
+  bool stillHere = (tryReadOnce() == currentUID);
+  setAntennaDrive(0xFF, 0x3F, 0x3F);           // restore full power immediately
+  return stillHere;
 }
 
 void pollRfid() {
@@ -401,25 +418,24 @@ void pollRfid() {
   // only ever get "present" after physically removing + replacing the tag, or resetting the
   // board with it in place (and even then only sometimes). WUPA wakes those tags too, so a
   // tag that is already there registers as present immediately.
-  // Retry a few times per scan: over a long cable a faint tag often fails the first attempt.
-  bool found = false;
-  for (int attempt = 0; attempt < 5 && !found; attempt++) {
-    byte atqa[2];
-    byte atqaSize = sizeof(atqa);
-    mfrc522.PCD_WriteRegister(mfrc522.TxModeReg, 0x00);
-    mfrc522.PCD_WriteRegister(mfrc522.RxModeReg, 0x00);
-    mfrc522.PCD_WriteRegister(mfrc522.ModWidthReg, 0x26);
-    MFRC522::StatusCode s = mfrc522.PICC_WakeupA(atqa, &atqaSize);
-    if ((s == MFRC522::STATUS_OK || s == MFRC522::STATUS_COLLISION) && mfrc522.PICC_ReadCardSerial())
-      found = true;
+  // FULL POWER first (5 tries): the field is the steady 0xFF from startRC522, never rewritten,
+  // so a DISTANCE tag reads here exactly as before - this is what the last sweep broke, fixed.
+  String uid = "";
+  for (int attempt = 0; attempt < 5 && uid == ""; attempt++) uid = tryReadOnce();
+  // Only if full power found NOTHING (so there's no distance read to disturb), occasionally dip
+  // to low power to catch a tag close enough to over-couple the strong field. Throttled to
+  // CLOSE_PROBE_INTERVAL and snapped straight back to full, so the steady field is barely touched.
+  if (uid == "" && millis() - lastCloseProbeAt >= CLOSE_PROBE_INTERVAL) {
+    lastCloseProbeAt = millis();
+    setAntennaDrive(0x44, 0x10, 0x10);
+    for (int attempt = 0; attempt < 2 && uid == ""; attempt++) uid = tryReadOnce();
+    setAntennaDrive(0xFF, 0x3F, 0x3F);
   }
-  if (found) {
-    currentUID = uidToString(mfrc522.uid);
+  if (uid != "") {
+    currentUID = uid;
     lastSeenAt = millis();
     Serial.println("Tag present: " + currentUID);
     postTagEvent(currentUID, "present");
-    mfrc522.PICC_HaltA();
-    mfrc522.PCD_StopCrypto1();
   }
 }
 
