@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.56"
+#define FW_VERSION "1.0.57"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -604,6 +604,14 @@ void setup() {
     for (int i = 0; i < NUM_SIGNALS; i++) {
       Serial.println("   gpio" + String(machineSignals[i].pin) + " " + String(machineSignals[i].name) +
                      " baseline=" + String(sigState[i] ? "ACTIVE" : "idle"));
+    }
+    // Boot self-test: post every channel's baseline state once, right after arming. Proves the
+    // device-machine-event HTTP path end-to-end (auth + URL + body) even when the machine hasn't
+    // cycled yet - so "no edges" and "HTTP broken" can be told apart. It also snapshots the exact
+    // idle/active level each input reads at power-up: an inverted or constant-level input shows up
+    // immediately here instead of looking like silence. WiFi is already up by this point in setup.
+    for (int i = 0; i < NUM_SIGNALS; i++) {
+      postMachineSignal(machineSignals[i].name, sigState[i], injectionShotCount);
     }
   } else {
     Serial.println("[mach] NOT armed - board #" + String(boardNum) + " is not machine 7 (dormant)");
