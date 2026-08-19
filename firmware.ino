@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.52"
+#define FW_VERSION "1.0.53"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -378,20 +378,40 @@ String tryReadOnce() {
   return "";
 }
 
+// Lightweight "is a tag still answering the field?" ping - a bare WakeupA, no full select.
+// A weakly-coupled tag (small round NTAG bin tags) will answer this even when it can't complete
+// a full re-read. Returns true if anything responds.
+bool tagAnswersField() {
+  for (int attempt = 0; attempt < 3; attempt++) {
+    byte atqa[2];
+    byte atqaSize = sizeof(atqa);
+    mfrc522.PCD_WriteRegister(mfrc522.TxModeReg, 0x00);
+    mfrc522.PCD_WriteRegister(mfrc522.RxModeReg, 0x00);
+    mfrc522.PCD_WriteRegister(mfrc522.ModWidthReg, 0x26);
+    MFRC522::StatusCode r = mfrc522.PICC_WakeupA(atqa, &atqaSize);
+    if (r == MFRC522::STATUS_OK || r == MFRC522::STATUS_COLLISION) return true;
+  }
+  return false;
+}
+
 bool isTagStillPresent() {
-  // Re-read the tag's UID and confirm it matches the one we're tracking (so "present" never goes
-  // stale). FULL POWER first, 5 tries - the field stays at the steady 0xFF from startRC522, NOT
-  // rewritten, so a DISTANCE tag re-reads here with its field undisturbed. More tries gives a
-  // tag near the edge of range extra chances to be re-read before we fall back, cutting false
-  // misses. Only if full power fails all 5 do we do ONE brief low-power dip to catch a CLOSE/
-  // over-coupled tag, then snap the field straight back to full. A far tag never triggers the dip.
+  // Tiered so it holds BOTH strong tags and weakly-coupled small ones without going stale:
+  // 1. FULL re-read at full power (5 tries) - a strong tag confirms its exact UID -> honest,
+  //    no stale. Field stays at the steady 0xFF from startRC522, so distance reads are undisturbed.
   for (int attempt = 0; attempt < 5; attempt++) {
     if (tryReadOnce() == currentUID) return true;
   }
-  setAntennaDrive(0x44, 0x10, 0x10);           // brief low-power dip for a close tag
-  bool stillHere = (tryReadOnce() == currentUID);
-  setAntennaDrive(0xFF, 0x3F, 0x3F);           // restore full power immediately
-  return stillHere;
+  // 2. FULL re-read at low power - a CLOSE tag that over-couples the strong field.
+  setAntennaDrive(0x44, 0x10, 0x10);
+  bool close = (tryReadOnce() == currentUID);
+  setAntennaDrive(0xFF, 0x3F, 0x3F);
+  if (close) return true;
+  // 3. Lenient WakeupA ping - a WEAKLY-COUPLED tag (the small round NTAG bin tags) answers the
+  //    field but can't finish a full select. This is what the old code did, and it's what held
+  //    the small tags before the stale-fix made the check strict. A genuinely REMOVED tag answers
+  //    none of the three -> it still clears after REMOVE_TIMEOUT. A wedged reader (spurious
+  //    answers) is handled separately by serviceReader's auto-recovery.
+  return tagAnswersField();
 }
 
 void pollRfid() {
