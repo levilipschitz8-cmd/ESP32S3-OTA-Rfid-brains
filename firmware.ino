@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.59"
+#define FW_VERSION "1.0.60"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -47,9 +47,12 @@ bool firstBeat = true;
 bool wifiUp = false;
 bool everConnected = false;             // reached the server at least once this boot
 // ---- Injection-machine signal monitoring (machine 7 ONLY; dormant on every other board) ----
-// Seven PC817-isolated signals from the moulding machine. INPUT_PULLDOWN, active-HIGH (LOW = idle):
-// active-HIGH signals need a pull-DOWN so an input that is idle (or briefly high-Z) rests LOW = idle.
-// A pull-UP would float an undriven input HIGH = permanently "active", so it never edges (was the bug).
+// Seven PC817-isolated signals from the moulding machine. INPUT_PULLUP, SELF-CALIBRATING polarity:
+// standard opto wiring (collector->GPIO, emitter->GND) only ever pulls the pin LOW when the function
+// fires and needs a pull-UP to sit HIGH at idle. So the pin swings HIGH<->LOW and the CHANGE interrupt
+// fires (a pull-DOWN left it stuck LOW in both states -> no swing, no interrupt: that was the v1.0.58
+// regression). Rather than hard-code active-HIGH/LOW, each channel's boot-rest level is captured as
+// "idle" and any departure from it is "active" - so a channel works whichever way it swings.
 // GPIO 5 (purple wire, terminal 112) is a wired spare, deliberately NOT listed until it's confirmed.
 bool injectionArmed = false;
 struct MachineSignal { byte pin; const char* name; bool isInjection; };  // isInjection drives the shot counter
@@ -63,7 +66,8 @@ MachineSignal machineSignals[] = {
   { 41, "ejecting_back",    false },   // terminal 111
 };
 const int NUM_SIGNALS = sizeof(machineSignals) / sizeof(machineSignals[0]);
-volatile bool          sigState[7];                 // current debounced state per channel (true = active/HIGH)
+volatile bool          sigIdleHigh[7];             // boot-rest level per channel (true=HIGH) = the "idle" reference
+volatile bool          sigState[7];                 // current debounced state per channel (true = active = away from idle)
 volatile bool          sigChanged[7];               // edge occurred -> loop posts and clears
 volatile unsigned long sigLastEdgeUs[7];            // last accepted edge time (us) for per-channel debounce
 volatile unsigned long injectionShotCount = 0;      // shots (injection rising edges) since boot
@@ -269,7 +273,8 @@ void IRAM_ATTR machineSignalISR(void* arg) {
   unsigned long now = micros();
   if (now - sigLastEdgeUs[i] < INJECTION_DEBOUNCE_US) return;     // debounce contact bounce
   sigLastEdgeUs[i] = now;
-  bool active = (digitalRead(machineSignals[i].pin) == HIGH);
+  bool level  = (digitalRead(machineSignals[i].pin) == HIGH);
+  bool active = (level != sigIdleHigh[i]);                        // active = departed from boot-rest (idle) level
   if (active != sigState[i]) {
     sigState[i] = active;
     if (active && machineSignals[i].isInjection) injectionShotCount++;  // idle -> firing = one shot
@@ -619,16 +624,19 @@ void setup() {
   startRC522();
 
   // Machine monitoring: ARM only on machine 7 (matched by board number OR device id). Seven PC817
-  // optocoupler taps of the moulding machine's signals. Each pin is INPUT_PULLDOWN, active-high
-  // (HIGH = active), edge-triggered so an edge is caught even while the loop is busy in a blocking
-  // HTTP post. Arm by BOARD NUMBER *or* device id - so a device-id that doesn't exactly match
-  // identities.txt can't leave monitoring silently dormant. Board 7 reports boardNum 7, so it arms.
+  // optocoupler taps of the moulding machine's signals. Each pin is INPUT_PULLUP; its boot-rest level
+  // is captured as "idle" and any departure is "active" (self-calibrating polarity), edge-triggered so
+  // an edge is caught even while the loop is busy in a blocking HTTP post. Arm by BOARD NUMBER *or*
+  // device id - so a device-id that doesn't exactly match identities.txt can't leave monitoring
+  // silently dormant. Board 7 reports boardNum 7, so it arms.
   if (boardNum == 7 || deviceId == INJECTION_DEVICE_ID) {
     // Continuity probe FIRST (before interrupts are attached): reports live vs floating per channel.
     probeMachineInputs();
     for (int i = 0; i < NUM_SIGNALS; i++) {
-      pinMode(machineSignals[i].pin, INPUT_PULLDOWN);
-      sigState[i]      = (digitalRead(machineSignals[i].pin) == HIGH);  // baseline, fire no event
+      pinMode(machineSignals[i].pin, INPUT_PULLUP);
+      delay(2);                                                        // let the pull-up settle before sampling
+      sigIdleHigh[i]   = (digitalRead(machineSignals[i].pin) == HIGH); // boot-rest level = the idle reference
+      sigState[i]      = false;                                        // at rest -> idle (no event)
       sigChanged[i]    = false;
       sigLastEdgeUs[i] = 0;
       attachInterruptArg(digitalPinToInterrupt(machineSignals[i].pin),
@@ -638,7 +646,7 @@ void setup() {
     Serial.println("[mach] ARMED " + String(NUM_SIGNALS) + " signals on board #" + String(boardNum) + ":");
     for (int i = 0; i < NUM_SIGNALS; i++) {
       Serial.println("   gpio" + String(machineSignals[i].pin) + " " + String(machineSignals[i].name) +
-                     " baseline=" + String(sigState[i] ? "ACTIVE" : "idle"));
+                     " idle-level=" + String(sigIdleHigh[i] ? "HIGH" : "LOW"));
     }
     // Boot self-test: post every channel's baseline state once, right after arming. Proves the
     // device-machine-event HTTP path end-to-end (auth + URL + body) even when the machine hasn't
