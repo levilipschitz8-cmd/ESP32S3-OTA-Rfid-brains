@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.62"
+#define FW_VERSION "1.0.63"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -47,33 +47,30 @@ bool firstBeat = true;
 bool wifiUp = false;
 bool everConnected = false;             // reached the server at least once this boot
 // ---- Injection-machine signal monitoring (machine 7 ONLY; dormant on every other board) ----
-// Seven PC817-isolated signals from the moulding machine. PER-CHANNEL pull + SELF-CALIBRATING polarity:
-// the boards mix two opposite optocoupler output wirings. One (collector->GPIO, emitter->GND) only
-// pulls the pin LOW and needs a pull-UP; the other (emitter->GPIO, collector->3V3) drives the pin HIGH
-// and needs a pull-DOWN. A single global pull kills half the channels (that was the whole saga), so at
-// boot a probe classifies each pin (driven_high vs floating/driven_low) and each channel gets the pull
-// that makes it actually SWING. On top of that, each channel's boot-rest level is captured as "idle"
-// and any departure is "active", so polarity (active-HIGH vs active-LOW) is handled automatically too.
-// GPIO 5 (purple wire, terminal 112) is a wired spare, deliberately NOT listed until it's confirmed.
+// Seven PC817-isolated signals from the moulding machine. Confirmed ACTIVE-LOW (GPIO 6 proved it:
+// pulled LOW when the mould opened, released HIGH). So: INPUT_PULLUP on every channel, and a pin is
+// "active" when it reads LOW, "idle" when it reads HIGH. An unconnected/idle input rests HIGH via the
+// pull-up = idle (no false events); a real signal sinks it LOW = active. The seven struct entries are
+// the SINGLE source of truth for BOTH the event path and the raw_levels string, so a signal name can
+// never drift relative to its GPIO. GPIO 5 (terminal 112) is a wired spare, deliberately not listed.
 bool injectionArmed = false;
 struct MachineSignal { byte pin; const char* name; bool isInjection; };  // isInjection drives the shot counter
 MachineSignal machineSignals[] = {
-  {  4, "injection",        true  },   // terminal 105
-  {  6, "mould_opening",    false },   // terminal 109
-  {  7, "ejecting_forward", false },   // terminal 110
-  { 15, "carriage_forward", false },   // terminal 104
-  { 16, "charge",           false },   // terminal 106  (plasticizing / screw recovery)
-  { 40, "carriage_back",    false },   // terminal 108
-  { 41, "ejecting_back",    false },   // terminal 111
+  {  4, "injection",        true  },   // raw_levels pos 1 - terminal 105
+  {  6, "mould_opening",    false },   // raw_levels pos 2 - terminal 109  (confirmed working)
+  {  7, "ejecting_forward", false },   // raw_levels pos 3 - terminal 110
+  { 15, "carriage_forward", false },   // raw_levels pos 4 - terminal 104
+  { 16, "charge",           false },   // raw_levels pos 5 - terminal 106  (plasticizing / screw recovery)
+  { 40, "carriage_back",    false },   // raw_levels pos 6 - terminal 108
+  { 41, "ejecting_back",    false },   // raw_levels pos 7 - terminal 111
 };
 const int NUM_SIGNALS = sizeof(machineSignals) / sizeof(machineSignals[0]);
-volatile bool          sigIdleHigh[7];             // boot-rest level per channel (true=HIGH) = the "idle" reference
-byte                   sigProbe[7];                // boot probe verdict per channel: 0=floating 1=driven_high 2=driven_low 3=noisy
-volatile bool          sigState[7];                 // current debounced state per channel (true = active = away from idle)
+volatile bool          sigState[7];                 // current debounced state per channel (true = active = LOW)
 volatile bool          sigChanged[7];               // edge occurred -> loop posts and clears
 volatile unsigned long sigLastEdgeUs[7];            // last accepted edge time (us) for per-channel debounce
-volatile unsigned long injectionShotCount = 0;      // shots (injection rising edges) since boot
-const unsigned long INJECTION_DEBOUNCE_US = 25000;  // 25 ms debounce per channel
+volatile unsigned long injectionShotCount = 0;      // shots (injection idle->active edges), persisted to NVS
+unsigned long          lastShotSaved = 0;           // last shot value written to NVS (throttle flash writes)
+const unsigned long INJECTION_DEBOUNCE_US = 40000;  // 40 ms debounce per channel
 String currentUID = "";
 byte lastReaderVersion = 0;             // last RC522 version byte read (for the status line)
 unsigned long lastSeenAt = 0;
@@ -85,7 +82,8 @@ unsigned long lastReaderCheckAt = 0;
 unsigned long lastStatusAt = 0;         // last time we printed the human status line
 unsigned long lastCloseProbeAt = 0;     // last low-power "close tag" probe while searching
 unsigned long lastGoodContactAt = 0;   // last successful (200) heartbeat
-unsigned long lastLevelSnapAt = 0;      // last raw pin-level snapshot (machine 7 diagnostic)
+unsigned long lastLevelSnapAt = 0;      // last raw pin-level snapshot POST (machine 7 diagnostic)
+unsigned long lastRawPrintAt = 0;       // last 1 Hz RAW serial print (machine 7 diagnostic)
 
 const unsigned long HEARTBEAT_INTERVAL   = 5000;
 const unsigned long RFID_POLL_INTERVAL   = 250;
@@ -268,20 +266,20 @@ void sendHeartbeat() {
   if (code == 200) { firstBeat = false; everConnected = true; lastGoodContactAt = millis(); handleCommand(resp); }
 }
 
-// Per-channel edge interrupt (machine 7 only): debounced, active-high (HIGH = signal active). Kept
-// minimal and in IRAM. The channel index is passed as the ISR arg so all six signals share one
-// handler. On the injection channel, an idle->active edge counts a shot. Interrupt (not polling) so
-// edges are still caught while the loop is stalled in a blocking HTTP post.
+// Per-channel edge interrupt (machine 7 only): ACTIVE-LOW, debounced, minimal, in IRAM. The channel
+// index is passed as the ISR arg so all seven signals share one handler. Interrupt (not 10 ms polling)
+// so an edge is still captured even while the loop is stalled in a blocking HTTP post - strictly better
+// than polling, which would miss an edge that falls inside a network call. On the injection channel a
+// clean idle(HIGH)->active(LOW) edge counts exactly one shot (never repeats while it stays LOW).
 void IRAM_ATTR machineSignalISR(void* arg) {
   int i = (int)(intptr_t)arg;
   unsigned long now = micros();
   if (now - sigLastEdgeUs[i] < INJECTION_DEBOUNCE_US) return;     // debounce contact bounce
   sigLastEdgeUs[i] = now;
-  bool level  = (digitalRead(machineSignals[i].pin) == HIGH);
-  bool active = (level != sigIdleHigh[i]);                        // active = departed from boot-rest (idle) level
+  bool active = (digitalRead(machineSignals[i].pin) == LOW);      // ACTIVE-LOW: LOW = active, HIGH = idle
   if (active != sigState[i]) {
     sigState[i] = active;
-    if (active && machineSignals[i].isInjection) injectionShotCount++;  // idle -> firing = one shot
+    if (active && machineSignals[i].isInjection) injectionShotCount++;  // idle->active edge = one shot
     sigChanged[i] = true;
   }
 }
@@ -300,35 +298,15 @@ void postMachineSignal(const char* name, bool active, unsigned long shots) {
                  " shot#" + String(shots) + " -> code=" + String(code));
 }
 
-// Boot continuity probe (machine 7). For each signal pin, sample it under an internal pull-UP, then
-// under an internal pull-DOWN. A pin that FOLLOWS the pull (HIGH with pull-up, LOW with pull-down)
-// has nothing on the optocoupler output driving it -> that channel's OUTPUT side isn't wired to the
-// ESP (missing 3V3 collector rail and/or common ground). A pin that reads the SAME level under both
-// pulls is being actively DRIVEN -> a live connection. This runs with the machine idle and nobody at
-// the board, and posts one row per channel so the wiring can be checked purely from the backend.
-// The known-good ejecting_forward channel is the reference: it should report "driven" (live).
-void probeMachineInputs() {
-  for (int i = 0; i < NUM_SIGNALS; i++) {
-    pinMode(machineSignals[i].pin, INPUT_PULLUP);
-    delay(3);
-    bool up = (digitalRead(machineSignals[i].pin) == HIGH);
-    pinMode(machineSignals[i].pin, INPUT_PULLDOWN);
-    delay(3);
-    bool down = (digitalRead(machineSignals[i].pin) == HIGH);
-    const char* verdict;
-    if      ( up && !down) { verdict = "floating";    sigProbe[i] = 0; } // follows the pull -> nothing driving it
-    else if ( up &&  down) { verdict = "driven_high"; sigProbe[i] = 1; } // held HIGH vs a pull-down -> live 3V3 source
-    else if (!up && !down) { verdict = "driven_low";  sigProbe[i] = 2; } // held LOW vs a pull-up  -> live GND sink
-    else                   { verdict = "noisy";       sigProbe[i] = 3; } // !up && down -> unstable, treat as suspect
-    Serial.println("[probe] " + String(machineSignals[i].name) + " gpio" + String(machineSignals[i].pin) +
-                   " up=" + String(up) + " down=" + String(down) + " -> " + verdict);
-    // Land it in machine_events via the same auth/endpoint; encode the verdict in the state field.
-    String resp;
-    String body = String("{\"signal\":\"") + machineSignals[i].name +
-                  "\",\"state\":\"probe_" + verdict +
-                  "\",\"shot_count\":0,\"uptime_ms\":" + String(millis()) + "}";
-    postJson(MACHINE_EVENT_URL, body, resp);
-  }
+// Persist the injection shot count across reboots (NVS), throttled so we only touch flash when the
+// count actually changed - injection cycles are seconds+ apart, so this is well within flash wear.
+void saveShotCount() {
+  unsigned long shots = injectionShotCount;
+  if (shots == lastShotSaved) return;
+  prefs.begin("machine", false);
+  prefs.putULong("shots", shots);
+  prefs.end();
+  lastShotSaved = shots;
 }
 
 void checkOTA() {
@@ -472,7 +450,7 @@ void printStatus() {
     String line = "[mach]";
     for (int i = 0; i < NUM_SIGNALS; i++) {
       line += " " + String(machineSignals[i].name) + "(gpio" + String(machineSignals[i].pin) + ")=" +
-              String(digitalRead(machineSignals[i].pin) == HIGH ? "ACT" : "idle");
+              String(digitalRead(machineSignals[i].pin) == LOW ? "ACT" : "idle");  // active-LOW
     }
     line += "  shots=" + String(injectionShotCount);
     Serial.println(line);
@@ -628,47 +606,31 @@ void setup() {
   startRC522();
 
   // Machine monitoring: ARM only on machine 7 (matched by board number OR device id). Seven PC817
-  // optocoupler taps of the moulding machine's signals. Each pin gets the pull the boot probe says it
-  // needs (pull-down for driven-high channels, pull-up otherwise); its boot-rest level is captured as
-  // "idle" and any departure is "active" (self-calibrating polarity), edge-triggered so an edge is
-  // caught even while the loop is busy in a blocking HTTP post. Arm by BOARD NUMBER *or*
-  // device id - so a device-id that doesn't exactly match identities.txt can't leave monitoring
-  // silently dormant. Board 7 reports boardNum 7, so it arms.
+  // optocoupler taps of the moulding machine's signals, all ACTIVE-LOW with INPUT_PULLUP: an idle or
+  // unconnected input rests HIGH (no false events), a real signal sinks it LOW = active. Edge-triggered
+  // so an edge is caught even while the loop is busy in a blocking HTTP post. Arm by BOARD NUMBER *or*
+  // device id so a device-id that doesn't match identities.txt can't leave monitoring silently dormant.
   if (boardNum == 7 || deviceId == INJECTION_DEVICE_ID) {
-    // Continuity probe FIRST (before interrupts are attached): reports live vs floating per channel.
-    probeMachineInputs();
+    // Restore the persisted shot count so a reboot doesn't reset it.
+    prefs.begin("machine", true);
+    injectionShotCount = prefs.getULong("shots", 0);
+    prefs.end();
+    lastShotSaved = injectionShotCount;
+    // Startup self-test: print the GPIO map only. It does NOT post events or touch the shot count.
+    Serial.println("[mach] GPIO MAP (machine 7)  pos  signal            gpio  active-level");
     for (int i = 0; i < NUM_SIGNALS; i++) {
-      // Pick the internal pull PER CHANNEL from the probe. An optocoupler output is driven in one
-      // state and floating in the other; the pull must define the floating state as the OPPOSITE of
-      // the driven state so the pin actually SWINGS. A channel driven HIGH at idle (probe=driven_high,
-      // e.g. emitter->GPIO / collector->3V3) needs a pull-DOWN so its released state reads LOW; every
-      // other case (floating or driven LOW at idle, e.g. the collector->GPIO / emitter->GND ejector)
-      // needs a pull-UP. This is what lets channels wired the two opposite ways coexist on one board.
-      bool usesPullDown = (sigProbe[i] == 1);                          // 1 = driven_high
-      pinMode(machineSignals[i].pin, usesPullDown ? INPUT_PULLDOWN : INPUT_PULLUP);
-      delay(2);                                                        // let the pull settle before sampling
-      sigIdleHigh[i]   = (digitalRead(machineSignals[i].pin) == HIGH); // boot-rest level = the idle reference
-      sigState[i]      = false;                                        // at rest -> idle (no event)
+      pinMode(machineSignals[i].pin, INPUT_PULLUP);
+      sigState[i]      = (digitalRead(machineSignals[i].pin) == LOW);   // seed with the live level (LOW=active)
       sigChanged[i]    = false;
       sigLastEdgeUs[i] = 0;
       attachInterruptArg(digitalPinToInterrupt(machineSignals[i].pin),
                          machineSignalISR, (void*)(intptr_t)i, CHANGE);
+      Serial.println("   [mach]   " + String(i + 1) + "   " + machineSignals[i].name +
+                     "  gpio" + String(machineSignals[i].pin) + "  LOW(active)  now=" +
+                     String(digitalRead(machineSignals[i].pin) == LOW ? "ACTIVE" : "idle"));
     }
     injectionArmed = true;
-    Serial.println("[mach] ARMED " + String(NUM_SIGNALS) + " signals on board #" + String(boardNum) + ":");
-    for (int i = 0; i < NUM_SIGNALS; i++) {
-      Serial.println("   gpio" + String(machineSignals[i].pin) + " " + String(machineSignals[i].name) +
-                     " pull=" + String(sigProbe[i] == 1 ? "DOWN" : "UP") +
-                     " idle-level=" + String(sigIdleHigh[i] ? "HIGH" : "LOW"));
-    }
-    // Boot self-test: post every channel's baseline state once, right after arming. Proves the
-    // device-machine-event HTTP path end-to-end (auth + URL + body) even when the machine hasn't
-    // cycled yet - so "no edges" and "HTTP broken" can be told apart. It also snapshots the exact
-    // idle/active level each input reads at power-up: an inverted or constant-level input shows up
-    // immediately here instead of looking like silence. WiFi is already up by this point in setup.
-    for (int i = 0; i < NUM_SIGNALS; i++) {
-      postMachineSignal(machineSignals[i].name, sigState[i], injectionShotCount);
-    }
+    Serial.println("[mach] ARMED " + String(NUM_SIGNALS) + " active-low inputs, shots restored=" + String(injectionShotCount));
   } else {
     Serial.println("[mach] NOT armed - board #" + String(boardNum) + " is not machine 7 (dormant)");
   }
@@ -730,7 +692,8 @@ void loop() {
     printStatus();
   }
 
-  // Machine signal changes (machine 7 only): each channel's ISR flags it; post each promptly.
+  // Machine signal changes (machine 7 only): each channel's ISR flags it; post each promptly and
+  // persist the shot count. The ISR captured the edge even if this post blocks, so none are lost.
   if (injectionArmed) {
     for (int i = 0; i < NUM_SIGNALS; i++) {
       if (!sigChanged[i]) continue;
@@ -739,15 +702,26 @@ void loop() {
       unsigned long shots = injectionShotCount;
       sigChanged[i] = false;
       interrupts();
+      Serial.println("[edge] " + String(machineSignals[i].name) + " gpio" + String(machineSignals[i].pin) +
+                     " -> " + String(active ? "ACTIVE(LOW)" : "idle(HIGH)") + " t=" + String(millis()));
       postMachineSignal(machineSignals[i].name, active, shots);
+      if (machineSignals[i].isInjection) saveShotCount();
     }
   }
 
-  // Raw pin-level snapshot (machine 7 diagnostic): every LEVEL_SNAP_INTERVAL, post the ACTUAL HIGH/LOW
-  // level of all 7 pins straight from digitalRead - bypassing the interrupt/edge path entirely. Posted
-  // as one row: signal="raw_levels", state = 7 chars (H/L) in machineSignals order. If these characters
-  // flip while the machine cycles but no active/idle events fire, the pins are moving and it's a detect
-  // bug; if they never flip while it cycles, the pins are electrically static (tap point). Ground truth.
+  // 1 Hz RAW serial diagnostic (machine 7): the literal level of all 7 pins, once a second, to serial.
+  if (injectionArmed && now - lastRawPrintAt >= 1000) {
+    lastRawPrintAt = now;
+    String lv = "";
+    for (int i = 0; i < NUM_SIGNALS; i++) lv += (digitalRead(machineSignals[i].pin) == HIGH) ? "H" : "L";
+    Serial.println("RAW " + lv + "  (inj,mould,ejF,carF,charge,carB,ejB)");
+  }
+
+  // Raw pin-level snapshot to the backend (machine 7): every LEVEL_SNAP_INTERVAL post the ACTUAL HIGH/
+  // LOW level of all 7 pins straight from digitalRead - bypassing the interrupt/edge path entirely.
+  // One row: signal="raw_levels", state = 7 chars (H/L) in machineSignals order. If a char flips while
+  // the machine cycles but no active/idle event fires -> detection bug; if a char never flips while its
+  // function cycles -> that pin is electrically static (tap point / wiring). Ground truth on the tablet.
   if (injectionArmed && now - lastLevelSnapAt >= LEVEL_SNAP_INTERVAL) {
     lastLevelSnapAt = now;
     String lv = "";
@@ -758,6 +732,5 @@ void loop() {
                   "\",\"shot_count\":" + String(injectionShotCount) +
                   ",\"uptime_ms\":" + String(millis()) + "}";
     postJson(MACHINE_EVENT_URL, body, resp);
-    Serial.println("[levels] " + lv + "  (inj,mould,ejF,carF,charge,carB,ejB)");
   }
 }
