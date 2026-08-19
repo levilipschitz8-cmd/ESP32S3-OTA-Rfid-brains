@@ -16,14 +16,14 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.55"
+#define FW_VERSION "1.0.56"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
 const char* CMD_RESULT_URL  = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-command-result";
 const char* FW_VERSION_URL  = "https://raw.githubusercontent.com/levilipschitz8-cmd/ESP32S3-OTA-Rfid-brains/main/fw-version.txt";
 const char* FIRMWARE_URL    = "https://github.com/levilipschitz8-cmd/ESP32S3-OTA-Rfid-brains/releases/latest/download/firmware.bin";
-const char* INJECTION_EVENT_URL = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-injection-event";
+const char* MACHINE_EVENT_URL = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-machine-event";
 const char* INJECTION_DEVICE_ID = "ec089dbd-7269-4c1d-86b8-e425400f80bf";  // machine 7 (board 7): injection monitor
 
 Preferences prefs;
@@ -37,7 +37,6 @@ String boardCode = "";
 #define MOSI_PIN 11
 #define SS_PIN   18
 #define RST_PIN  17
-#define INJECTION_PIN 4    // machine 7 ONLY: PC817 optocoupler tap of the injection-machine firing signal
 
 WiFiMulti wifiMulti;
 MFRC522 mfrc522(SS_PIN, RST_PIN);
@@ -47,13 +46,26 @@ bool rc522Ok = false;
 bool firstBeat = true;
 bool wifiUp = false;
 bool everConnected = false;             // reached the server at least once this boot
-// ---- Injection monitoring (machine 7 ONLY; dormant on every other board) ----
-bool injectionArmed = false;                        // true only on machine 7 (the injection device id)
-volatile bool injectionFiring = false;              // current debounced state: true = injection firing
-volatile unsigned long injectionShotCount = 0;      // cumulative shots (idle->firing edges) since boot
-volatile bool injectionChanged = false;             // ISR sets on state change; loop posts and clears
-volatile unsigned long injectionLastEdgeUs = 0;     // last accepted edge time (us) for debounce
-const unsigned long INJECTION_DEBOUNCE_US = 25000;  // 25 ms debounce
+// ---- Injection-machine signal monitoring (machine 7 ONLY; dormant on every other board) ----
+// Seven PC817-isolated signals from the moulding machine. INPUT_PULLUP, active-HIGH (LOW = idle).
+// GPIO 5 (purple wire, terminal 112) is a wired spare, deliberately NOT listed until it's confirmed.
+bool injectionArmed = false;
+struct MachineSignal { byte pin; const char* name; bool isInjection; };  // isInjection drives the shot counter
+MachineSignal machineSignals[] = {
+  {  4, "injection",        true  },   // terminal 105
+  {  6, "mould_opening",    false },   // terminal 109
+  {  7, "ejecting_forward", false },   // terminal 110
+  { 15, "carriage_forward", false },   // terminal 104
+  { 16, "charge",           false },   // terminal 106  (plasticizing / screw recovery)
+  { 40, "carriage_back",    false },   // terminal 108
+  { 41, "ejecting_back",    false },   // terminal 111
+};
+const int NUM_SIGNALS = sizeof(machineSignals) / sizeof(machineSignals[0]);
+volatile bool          sigState[7];                 // current debounced state per channel (true = active/HIGH)
+volatile bool          sigChanged[7];               // edge occurred -> loop posts and clears
+volatile unsigned long sigLastEdgeUs[7];            // last accepted edge time (us) for per-channel debounce
+volatile unsigned long injectionShotCount = 0;      // shots (injection rising edges) since boot
+const unsigned long INJECTION_DEBOUNCE_US = 25000;  // 25 ms debounce per channel
 String currentUID = "";
 byte lastReaderVersion = 0;             // last RC522 version byte read (for the status line)
 unsigned long lastSeenAt = 0;
@@ -246,30 +258,35 @@ void sendHeartbeat() {
   if (code == 200) { firstBeat = false; everConnected = true; lastGoodContactAt = millis(); handleCommand(resp); }
 }
 
-// GPIO 4 edge interrupt (machine 7 only): debounced, active-high (HIGH = injection firing). Kept
-// minimal and in IRAM. Counts a shot on each idle->firing edge and flags the loop to post. An
-// interrupt (not polling) so shots are still caught while the loop is stalled in a blocking HTTP post.
-void IRAM_ATTR injectionISR() {
+// Per-channel edge interrupt (machine 7 only): debounced, active-high (HIGH = signal active). Kept
+// minimal and in IRAM. The channel index is passed as the ISR arg so all six signals share one
+// handler. On the injection channel, an idle->active edge counts a shot. Interrupt (not polling) so
+// edges are still caught while the loop is stalled in a blocking HTTP post.
+void IRAM_ATTR machineSignalISR(void* arg) {
+  int i = (int)(intptr_t)arg;
   unsigned long now = micros();
-  if (now - injectionLastEdgeUs < INJECTION_DEBOUNCE_US) return;   // debounce contact bounce
-  injectionLastEdgeUs = now;
-  bool firing = (digitalRead(INJECTION_PIN) == HIGH);
-  if (firing != injectionFiring) {
-    injectionFiring = firing;
-    if (firing) injectionShotCount++;                             // idle -> firing = one shot
-    injectionChanged = true;
+  if (now - sigLastEdgeUs[i] < INJECTION_DEBOUNCE_US) return;     // debounce contact bounce
+  sigLastEdgeUs[i] = now;
+  bool active = (digitalRead(machineSignals[i].pin) == HIGH);
+  if (active != sigState[i]) {
+    sigState[i] = active;
+    if (active && machineSignals[i].isInjection) injectionShotCount++;  // idle -> firing = one shot
+    sigChanged[i] = true;
   }
 }
 
-// POST an injection state change to Supabase (machine 7). Reuses the SAME X-Device-Id/X-Device-Key
-// auth as the heartbeat. Server stamps the time (created_at); we send state + shot count + uptime.
-void postInjectionEvent(bool firing, unsigned long shots) {
+// POST one machine signal state change to Supabase (machine 7). Reuses the SAME X-Device-Id/
+// X-Device-Key auth as the heartbeat. Server stamps the time (created_at); we send which signal,
+// its new state, the running shot count and uptime.
+void postMachineSignal(const char* name, bool active, unsigned long shots) {
   String resp;
-  String body = String("{\"state\":\"") + (firing ? "firing" : "idle") +
+  String body = String("{\"signal\":\"") + name +
+                "\",\"state\":\"" + (active ? "active" : "idle") +
                 "\",\"shot_count\":" + String(shots) +
                 ",\"uptime_ms\":" + String(millis()) + "}";
-  int code = postJson(INJECTION_EVENT_URL, body, resp);
-  Serial.println("[inj] " + String(firing ? "FIRING" : "idle") + " shot#" + String(shots) + " -> code=" + String(code));
+  int code = postJson(MACHINE_EVENT_URL, body, resp);
+  Serial.println("[mach] " + String(name) + " " + String(active ? "ACTIVE" : "idle") +
+                 " shot#" + String(shots) + " -> code=" + String(code));
 }
 
 void checkOTA() {
@@ -290,7 +307,8 @@ void checkOTA() {
     if (targeted && versionNewer(remoteVer, FW_VERSION)) {
       Serial.println("[ota] " + String(FW_VERSION) + " -> " + remoteVer + " ... downloading");
       http.end();
-      if (injectionArmed) detachInterrupt(digitalPinToInterrupt(INJECTION_PIN)); // no ISR during flash write
+      if (injectionArmed)                                          // no ISR during flash write
+        for (int i = 0; i < NUM_SIGNALS; i++) detachInterrupt(digitalPinToInterrupt(machineSignals[i].pin));
       WiFiClientSecure up; up.setInsecure();
       httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
       t_httpUpdate_return r = httpUpdate.update(up, FIRMWARE_URL);
@@ -406,13 +424,16 @@ void printStatus() {
                  "  READER=" + reader +
                  "  tag=" + tag +
                  "  wifi=" + wifi);
-  // Live injection view (machine 7 only): raw GPIO 4 level + tracked state + shot count, so the pin
-  // can be watched changing while the machine fires - the fastest way to tell wiring from logic.
+  // Live machine view (machine 7 only): raw GPIO level per channel, so each pin can be watched
+  // changing while the machine runs - the fastest way to tell wiring from logic. Shot count last.
   if (injectionArmed) {
-    Serial.println("[inj] GPIO" + String(INJECTION_PIN) + " reads " +
-                   String(digitalRead(INJECTION_PIN) == HIGH ? "HIGH/firing" : "LOW/idle") +
-                   "  tracked=" + String(injectionFiring ? "firing" : "idle") +
-                   "  shots=" + String(injectionShotCount));
+    String line = "[mach]";
+    for (int i = 0; i < NUM_SIGNALS; i++) {
+      line += " " + String(machineSignals[i].name) + "(gpio" + String(machineSignals[i].pin) + ")=" +
+              String(digitalRead(machineSignals[i].pin) == HIGH ? "ACT" : "idle");
+    }
+    line += "  shots=" + String(injectionShotCount);
+    Serial.println(line);
   }
 }
 
@@ -564,21 +585,28 @@ void setup() {
 
   startRC522();
 
-  // Injection monitoring: ARM only on machine 7 (matched by device id). GPIO 4 taps the injection
-  // machine's firing signal through a PC817 optocoupler. INPUT_PULLUP, active-high (HIGH = firing),
-  // edge-triggered so a shot is caught even while the loop is busy with a blocking HTTP post.
-  // Arm on machine 7 by BOARD NUMBER *or* device id - so a device-id that doesn't exactly match
-  // identities.txt can't leave injection silently dormant (that would look exactly like "online,
-  // 1.0.54, but zero injection events ever"). Board 7 reports boardNum 7, so this reliably arms it.
+  // Machine monitoring: ARM only on machine 7 (matched by board number OR device id). Seven PC817
+  // optocoupler taps of the moulding machine's signals. Each pin is INPUT_PULLUP, active-high
+  // (HIGH = active), edge-triggered so an edge is caught even while the loop is busy in a blocking
+  // HTTP post. Arm by BOARD NUMBER *or* device id - so a device-id that doesn't exactly match
+  // identities.txt can't leave monitoring silently dormant. Board 7 reports boardNum 7, so it arms.
   if (boardNum == 7 || deviceId == INJECTION_DEVICE_ID) {
-    pinMode(INJECTION_PIN, INPUT_PULLUP);
-    injectionFiring = (digitalRead(INJECTION_PIN) == HIGH);   // establish baseline, fire no event
-    attachInterrupt(digitalPinToInterrupt(INJECTION_PIN), injectionISR, CHANGE);
+    for (int i = 0; i < NUM_SIGNALS; i++) {
+      pinMode(machineSignals[i].pin, INPUT_PULLUP);
+      sigState[i]      = (digitalRead(machineSignals[i].pin) == HIGH);  // baseline, fire no event
+      sigChanged[i]    = false;
+      sigLastEdgeUs[i] = 0;
+      attachInterruptArg(digitalPinToInterrupt(machineSignals[i].pin),
+                         machineSignalISR, (void*)(intptr_t)i, CHANGE);
+    }
     injectionArmed = true;
-    Serial.println("[inj] ARMED on GPIO " + String(INJECTION_PIN) + " (board #" + String(boardNum) +
-                   ") - baseline " + String(injectionFiring ? "HIGH/firing" : "LOW/idle"));
+    Serial.println("[mach] ARMED " + String(NUM_SIGNALS) + " signals on board #" + String(boardNum) + ":");
+    for (int i = 0; i < NUM_SIGNALS; i++) {
+      Serial.println("   gpio" + String(machineSignals[i].pin) + " " + String(machineSignals[i].name) +
+                     " baseline=" + String(sigState[i] ? "ACTIVE" : "idle"));
+    }
   } else {
-    Serial.println("[inj] NOT armed - board #" + String(boardNum) + " is not machine 7 (dormant)");
+    Serial.println("[mach] NOT armed - board #" + String(boardNum) + " is not machine 7 (dormant)");
   }
 
   Serial.println("========================================");
@@ -638,13 +666,16 @@ void loop() {
     printStatus();
   }
 
-  // Injection state change (machine 7 only): the GPIO 4 ISR flags it; post it promptly.
-  if (injectionArmed && injectionChanged) {
-    noInterrupts();
-    bool firing = injectionFiring;
-    unsigned long shots = injectionShotCount;
-    injectionChanged = false;
-    interrupts();
-    postInjectionEvent(firing, shots);
+  // Machine signal changes (machine 7 only): each channel's ISR flags it; post each promptly.
+  if (injectionArmed) {
+    for (int i = 0; i < NUM_SIGNALS; i++) {
+      if (!sigChanged[i]) continue;
+      noInterrupts();
+      bool active = sigState[i];
+      unsigned long shots = injectionShotCount;
+      sigChanged[i] = false;
+      interrupts();
+      postMachineSignal(machineSignals[i].name, active, shots);
+    }
   }
 }
