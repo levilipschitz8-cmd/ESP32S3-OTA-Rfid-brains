@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.60"
+#define FW_VERSION "1.0.61"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -47,12 +47,13 @@ bool firstBeat = true;
 bool wifiUp = false;
 bool everConnected = false;             // reached the server at least once this boot
 // ---- Injection-machine signal monitoring (machine 7 ONLY; dormant on every other board) ----
-// Seven PC817-isolated signals from the moulding machine. INPUT_PULLUP, SELF-CALIBRATING polarity:
-// standard opto wiring (collector->GPIO, emitter->GND) only ever pulls the pin LOW when the function
-// fires and needs a pull-UP to sit HIGH at idle. So the pin swings HIGH<->LOW and the CHANGE interrupt
-// fires (a pull-DOWN left it stuck LOW in both states -> no swing, no interrupt: that was the v1.0.58
-// regression). Rather than hard-code active-HIGH/LOW, each channel's boot-rest level is captured as
-// "idle" and any departure from it is "active" - so a channel works whichever way it swings.
+// Seven PC817-isolated signals from the moulding machine. PER-CHANNEL pull + SELF-CALIBRATING polarity:
+// the boards mix two opposite optocoupler output wirings. One (collector->GPIO, emitter->GND) only
+// pulls the pin LOW and needs a pull-UP; the other (emitter->GPIO, collector->3V3) drives the pin HIGH
+// and needs a pull-DOWN. A single global pull kills half the channels (that was the whole saga), so at
+// boot a probe classifies each pin (driven_high vs floating/driven_low) and each channel gets the pull
+// that makes it actually SWING. On top of that, each channel's boot-rest level is captured as "idle"
+// and any departure is "active", so polarity (active-HIGH vs active-LOW) is handled automatically too.
 // GPIO 5 (purple wire, terminal 112) is a wired spare, deliberately NOT listed until it's confirmed.
 bool injectionArmed = false;
 struct MachineSignal { byte pin; const char* name; bool isInjection; };  // isInjection drives the shot counter
@@ -67,6 +68,7 @@ MachineSignal machineSignals[] = {
 };
 const int NUM_SIGNALS = sizeof(machineSignals) / sizeof(machineSignals[0]);
 volatile bool          sigIdleHigh[7];             // boot-rest level per channel (true=HIGH) = the "idle" reference
+byte                   sigProbe[7];                // boot probe verdict per channel: 0=floating 1=driven_high 2=driven_low 3=noisy
 volatile bool          sigState[7];                 // current debounced state per channel (true = active = away from idle)
 volatile bool          sigChanged[7];               // edge occurred -> loop posts and clears
 volatile unsigned long sigLastEdgeUs[7];            // last accepted edge time (us) for per-channel debounce
@@ -312,10 +314,10 @@ void probeMachineInputs() {
     delay(3);
     bool down = (digitalRead(machineSignals[i].pin) == HIGH);
     const char* verdict;
-    if      ( up && !down) verdict = "floating";     // follows the pull -> output side not connected
-    else if ( up &&  down) verdict = "driven_high";  // held HIGH against a pull-down -> live 3V3 source
-    else if (!up && !down) verdict = "driven_low";   // held LOW against a pull-up  -> live GND sink
-    else                   verdict = "noisy";        // !up && down -> unstable/floating, treat as suspect
+    if      ( up && !down) { verdict = "floating";    sigProbe[i] = 0; } // follows the pull -> nothing driving it
+    else if ( up &&  down) { verdict = "driven_high"; sigProbe[i] = 1; } // held HIGH vs a pull-down -> live 3V3 source
+    else if (!up && !down) { verdict = "driven_low";  sigProbe[i] = 2; } // held LOW vs a pull-up  -> live GND sink
+    else                   { verdict = "noisy";       sigProbe[i] = 3; } // !up && down -> unstable, treat as suspect
     Serial.println("[probe] " + String(machineSignals[i].name) + " gpio" + String(machineSignals[i].pin) +
                    " up=" + String(up) + " down=" + String(down) + " -> " + verdict);
     // Land it in machine_events via the same auth/endpoint; encode the verdict in the state field.
@@ -624,17 +626,25 @@ void setup() {
   startRC522();
 
   // Machine monitoring: ARM only on machine 7 (matched by board number OR device id). Seven PC817
-  // optocoupler taps of the moulding machine's signals. Each pin is INPUT_PULLUP; its boot-rest level
-  // is captured as "idle" and any departure is "active" (self-calibrating polarity), edge-triggered so
-  // an edge is caught even while the loop is busy in a blocking HTTP post. Arm by BOARD NUMBER *or*
+  // optocoupler taps of the moulding machine's signals. Each pin gets the pull the boot probe says it
+  // needs (pull-down for driven-high channels, pull-up otherwise); its boot-rest level is captured as
+  // "idle" and any departure is "active" (self-calibrating polarity), edge-triggered so an edge is
+  // caught even while the loop is busy in a blocking HTTP post. Arm by BOARD NUMBER *or*
   // device id - so a device-id that doesn't exactly match identities.txt can't leave monitoring
   // silently dormant. Board 7 reports boardNum 7, so it arms.
   if (boardNum == 7 || deviceId == INJECTION_DEVICE_ID) {
     // Continuity probe FIRST (before interrupts are attached): reports live vs floating per channel.
     probeMachineInputs();
     for (int i = 0; i < NUM_SIGNALS; i++) {
-      pinMode(machineSignals[i].pin, INPUT_PULLUP);
-      delay(2);                                                        // let the pull-up settle before sampling
+      // Pick the internal pull PER CHANNEL from the probe. An optocoupler output is driven in one
+      // state and floating in the other; the pull must define the floating state as the OPPOSITE of
+      // the driven state so the pin actually SWINGS. A channel driven HIGH at idle (probe=driven_high,
+      // e.g. emitter->GPIO / collector->3V3) needs a pull-DOWN so its released state reads LOW; every
+      // other case (floating or driven LOW at idle, e.g. the collector->GPIO / emitter->GND ejector)
+      // needs a pull-UP. This is what lets channels wired the two opposite ways coexist on one board.
+      bool usesPullDown = (sigProbe[i] == 1);                          // 1 = driven_high
+      pinMode(machineSignals[i].pin, usesPullDown ? INPUT_PULLDOWN : INPUT_PULLUP);
+      delay(2);                                                        // let the pull settle before sampling
       sigIdleHigh[i]   = (digitalRead(machineSignals[i].pin) == HIGH); // boot-rest level = the idle reference
       sigState[i]      = false;                                        // at rest -> idle (no event)
       sigChanged[i]    = false;
@@ -646,6 +656,7 @@ void setup() {
     Serial.println("[mach] ARMED " + String(NUM_SIGNALS) + " signals on board #" + String(boardNum) + ":");
     for (int i = 0; i < NUM_SIGNALS; i++) {
       Serial.println("   gpio" + String(machineSignals[i].pin) + " " + String(machineSignals[i].name) +
+                     " pull=" + String(sigProbe[i] == 1 ? "DOWN" : "UP") +
                      " idle-level=" + String(sigIdleHigh[i] ? "HIGH" : "LOW"));
     }
     // Boot self-test: post every channel's baseline state once, right after arming. Proves the
