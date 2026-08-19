@@ -47,7 +47,8 @@ bool firstBeat = true;
 bool wifiUp = false;
 bool everConnected = false;             // reached the server at least once this boot
 // ---- Injection-machine signal monitoring (machine 7 ONLY; dormant on every other board) ----
-// Six PC817-isolated signals from the moulding machine. INPUT_PULLUP, active-HIGH (LOW = idle).
+// Seven PC817-isolated signals from the moulding machine. INPUT_PULLUP, active-HIGH (LOW = idle).
+// GPIO 5 (purple wire, terminal 112) is a wired spare, deliberately NOT listed until it's confirmed.
 bool injectionArmed = false;
 struct MachineSignal { byte pin; const char* name; bool isInjection; };  // isInjection drives the shot counter
 MachineSignal machineSignals[] = {
@@ -55,13 +56,14 @@ MachineSignal machineSignals[] = {
   {  6, "mould_opening",    false },   // terminal 109
   {  7, "ejecting_forward", false },   // terminal 110
   { 15, "carriage_forward", false },   // terminal 104
+  { 16, "charge",           false },   // terminal 106  (plasticizing / screw recovery)
   { 40, "carriage_back",    false },   // terminal 108
   { 41, "ejecting_back",    false },   // terminal 111
 };
 const int NUM_SIGNALS = sizeof(machineSignals) / sizeof(machineSignals[0]);
-volatile bool          sigState[6];                 // current debounced state per channel (true = active/HIGH)
-volatile bool          sigChanged[6];               // edge occurred -> loop posts and clears
-volatile unsigned long sigLastEdgeUs[6];            // last accepted edge time (us) for per-channel debounce
+volatile bool          sigState[7];                 // current debounced state per channel (true = active/HIGH)
+volatile bool          sigChanged[7];               // edge occurred -> loop posts and clears
+volatile unsigned long sigLastEdgeUs[7];            // last accepted edge time (us) for per-channel debounce
 volatile unsigned long injectionShotCount = 0;      // shots (injection rising edges) since boot
 const unsigned long INJECTION_DEBOUNCE_US = 25000;  // 25 ms debounce per channel
 String currentUID = "";
@@ -583,7 +585,7 @@ void setup() {
 
   startRC522();
 
-  // Machine monitoring: ARM only on machine 7 (matched by board number OR device id). Six PC817
+  // Machine monitoring: ARM only on machine 7 (matched by board number OR device id). Seven PC817
   // optocoupler taps of the moulding machine's signals. Each pin is INPUT_PULLUP, active-high
   // (HIGH = active), edge-triggered so an edge is caught even while the loop is busy in a blocking
   // HTTP post. Arm by BOARD NUMBER *or* device id - so a device-id that doesn't exactly match
