@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.61"
+#define FW_VERSION "1.0.62"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -85,10 +85,12 @@ unsigned long lastReaderCheckAt = 0;
 unsigned long lastStatusAt = 0;         // last time we printed the human status line
 unsigned long lastCloseProbeAt = 0;     // last low-power "close tag" probe while searching
 unsigned long lastGoodContactAt = 0;   // last successful (200) heartbeat
+unsigned long lastLevelSnapAt = 0;      // last raw pin-level snapshot (machine 7 diagnostic)
 
 const unsigned long HEARTBEAT_INTERVAL   = 5000;
 const unsigned long RFID_POLL_INTERVAL   = 250;
 const unsigned long WIFI_CHECK_INTERVAL  = 5000;
+const unsigned long LEVEL_SNAP_INTERVAL  = 15000;    // machine 7: raw pin-level snapshot period (diagnostic)
 const unsigned long OTA_CHECK_INTERVAL   = 60000;    // 60s
 const unsigned long READER_CHECK_INTERVAL = 3000;    // hot-plug re-check
 const unsigned long STATUS_INTERVAL      = 2000;     // print a clear per-board status line this often
@@ -739,5 +741,23 @@ void loop() {
       interrupts();
       postMachineSignal(machineSignals[i].name, active, shots);
     }
+  }
+
+  // Raw pin-level snapshot (machine 7 diagnostic): every LEVEL_SNAP_INTERVAL, post the ACTUAL HIGH/LOW
+  // level of all 7 pins straight from digitalRead - bypassing the interrupt/edge path entirely. Posted
+  // as one row: signal="raw_levels", state = 7 chars (H/L) in machineSignals order. If these characters
+  // flip while the machine cycles but no active/idle events fire, the pins are moving and it's a detect
+  // bug; if they never flip while it cycles, the pins are electrically static (tap point). Ground truth.
+  if (injectionArmed && now - lastLevelSnapAt >= LEVEL_SNAP_INTERVAL) {
+    lastLevelSnapAt = now;
+    String lv = "";
+    for (int i = 0; i < NUM_SIGNALS; i++)
+      lv += (digitalRead(machineSignals[i].pin) == HIGH) ? "H" : "L";
+    String resp;
+    String body = String("{\"signal\":\"raw_levels\",\"state\":\"") + lv +
+                  "\",\"shot_count\":" + String(injectionShotCount) +
+                  ",\"uptime_ms\":" + String(millis()) + "}";
+    postJson(MACHINE_EVENT_URL, body, resp);
+    Serial.println("[levels] " + lv + "  (inj,mould,ejF,carF,charge,carB,ejB)");
   }
 }
