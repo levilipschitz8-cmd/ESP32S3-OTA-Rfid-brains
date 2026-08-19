@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.57"
+#define FW_VERSION "1.0.58"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -47,7 +47,9 @@ bool firstBeat = true;
 bool wifiUp = false;
 bool everConnected = false;             // reached the server at least once this boot
 // ---- Injection-machine signal monitoring (machine 7 ONLY; dormant on every other board) ----
-// Seven PC817-isolated signals from the moulding machine. INPUT_PULLUP, active-HIGH (LOW = idle).
+// Seven PC817-isolated signals from the moulding machine. INPUT_PULLDOWN, active-HIGH (LOW = idle):
+// active-HIGH signals need a pull-DOWN so an input that is idle (or briefly high-Z) rests LOW = idle.
+// A pull-UP would float an undriven input HIGH = permanently "active", so it never edges (was the bug).
 // GPIO 5 (purple wire, terminal 112) is a wired spare, deliberately NOT listed until it's confirmed.
 bool injectionArmed = false;
 struct MachineSignal { byte pin; const char* name; bool isInjection; };  // isInjection drives the shot counter
@@ -586,13 +588,13 @@ void setup() {
   startRC522();
 
   // Machine monitoring: ARM only on machine 7 (matched by board number OR device id). Seven PC817
-  // optocoupler taps of the moulding machine's signals. Each pin is INPUT_PULLUP, active-high
+  // optocoupler taps of the moulding machine's signals. Each pin is INPUT_PULLDOWN, active-high
   // (HIGH = active), edge-triggered so an edge is caught even while the loop is busy in a blocking
   // HTTP post. Arm by BOARD NUMBER *or* device id - so a device-id that doesn't exactly match
   // identities.txt can't leave monitoring silently dormant. Board 7 reports boardNum 7, so it arms.
   if (boardNum == 7 || deviceId == INJECTION_DEVICE_ID) {
     for (int i = 0; i < NUM_SIGNALS; i++) {
-      pinMode(machineSignals[i].pin, INPUT_PULLUP);
+      pinMode(machineSignals[i].pin, INPUT_PULLDOWN);
       sigState[i]      = (digitalRead(machineSignals[i].pin) == HIGH);  // baseline, fire no event
       sigChanged[i]    = false;
       sigLastEdgeUs[i] = 0;
