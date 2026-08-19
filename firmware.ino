@@ -16,13 +16,15 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.53"
+#define FW_VERSION "1.0.54"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
 const char* CMD_RESULT_URL  = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-command-result";
 const char* FW_VERSION_URL  = "https://raw.githubusercontent.com/levilipschitz8-cmd/ESP32S3-OTA-Rfid-brains/main/fw-version.txt";
 const char* FIRMWARE_URL    = "https://github.com/levilipschitz8-cmd/ESP32S3-OTA-Rfid-brains/releases/latest/download/firmware.bin";
+const char* INJECTION_EVENT_URL = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-injection-event";
+const char* INJECTION_DEVICE_ID = "ec089dbd-7269-4c1d-86b8-e425400f80bf";  // machine 7 (board 7): injection monitor
 
 Preferences prefs;
 int boardNum = BOARD_NUM;
@@ -35,6 +37,7 @@ String boardCode = "";
 #define MOSI_PIN 11
 #define SS_PIN   18
 #define RST_PIN  17
+#define INJECTION_PIN 4    // machine 7 ONLY: PC817 optocoupler tap of the injection-machine firing signal
 
 WiFiMulti wifiMulti;
 MFRC522 mfrc522(SS_PIN, RST_PIN);
@@ -44,6 +47,13 @@ bool rc522Ok = false;
 bool firstBeat = true;
 bool wifiUp = false;
 bool everConnected = false;             // reached the server at least once this boot
+// ---- Injection monitoring (machine 7 ONLY; dormant on every other board) ----
+bool injectionArmed = false;                        // true only on machine 7 (the injection device id)
+volatile bool injectionFiring = false;              // current debounced state: true = injection firing
+volatile unsigned long injectionShotCount = 0;      // cumulative shots (idle->firing edges) since boot
+volatile bool injectionChanged = false;             // ISR sets on state change; loop posts and clears
+volatile unsigned long injectionLastEdgeUs = 0;     // last accepted edge time (us) for debounce
+const unsigned long INJECTION_DEBOUNCE_US = 25000;  // 25 ms debounce
 String currentUID = "";
 byte lastReaderVersion = 0;             // last RC522 version byte read (for the status line)
 unsigned long lastSeenAt = 0;
@@ -164,6 +174,25 @@ bool writeTagBlock(int block, const String& data, String& detail) {
   byte buf[16];
   memset(buf, 0, 16);
   for (int i = 0; i < 16 && i < (int)data.length(); i++) buf[i] = (byte)data[i];
+
+  // NTAG / Mifare Ultralight tags (SAK 0x00) do NOT support Mifare Classic authentication. The old
+  // code ran PCD_Authenticate on EVERY tag, which ALWAYS fails on an NTAG - and that failed auth
+  // left the reader in a state that jammed subsequent reads (the small round bin tags are NTAG, so
+  // repeated failed writes were knocking the bin-tag reads out). Detect NTAG by its SAK and write it
+  // the correct way: 4-byte page writes, no auth. Mifare Classic tags fall through and behave exactly
+  // as before, so nothing changes for cards/tags that were already writing fine.
+  if (mfrc522.uid.sak == 0x00) {
+    bool ok = true;
+    for (int p = 0; p < 4 && ok; p++) {                 // 16 bytes = 4 x 4-byte NTAG pages
+      byte page[4] = { buf[p*4], buf[p*4+1], buf[p*4+2], buf[p*4+3] };
+      if (mfrc522.MIFARE_Ultralight_Write((byte)(block + p), page, 4) != MFRC522::STATUS_OK) ok = false;
+    }
+    detail = ok ? ("wrote ntag pages " + String(block) + "-" + String(block + 3)) : "ntag write failed";
+    mfrc522.PICC_HaltA();
+    return ok;
+  }
+
+  // Mifare Classic: authenticate the block with key A, then write (unchanged behaviour).
   MFRC522::StatusCode st = mfrc522.PCD_Authenticate(
       MFRC522::PICC_CMD_MF_AUTH_KEY_A, (byte)block, &mifareKey, &(mfrc522.uid));
   if (st != MFRC522::STATUS_OK) {
@@ -217,6 +246,32 @@ void sendHeartbeat() {
   if (code == 200) { firstBeat = false; everConnected = true; lastGoodContactAt = millis(); handleCommand(resp); }
 }
 
+// GPIO 4 edge interrupt (machine 7 only): debounced, active-high (HIGH = injection firing). Kept
+// minimal and in IRAM. Counts a shot on each idle->firing edge and flags the loop to post. An
+// interrupt (not polling) so shots are still caught while the loop is stalled in a blocking HTTP post.
+void IRAM_ATTR injectionISR() {
+  unsigned long now = micros();
+  if (now - injectionLastEdgeUs < INJECTION_DEBOUNCE_US) return;   // debounce contact bounce
+  injectionLastEdgeUs = now;
+  bool firing = (digitalRead(INJECTION_PIN) == HIGH);
+  if (firing != injectionFiring) {
+    injectionFiring = firing;
+    if (firing) injectionShotCount++;                             // idle -> firing = one shot
+    injectionChanged = true;
+  }
+}
+
+// POST an injection state change to Supabase (machine 7). Reuses the SAME X-Device-Id/X-Device-Key
+// auth as the heartbeat. Server stamps the time (created_at); we send state + shot count + uptime.
+void postInjectionEvent(bool firing, unsigned long shots) {
+  String resp;
+  String body = String("{\"state\":\"") + (firing ? "firing" : "idle") +
+                "\",\"shot_count\":" + String(shots) +
+                ",\"uptime_ms\":" + String(millis()) + "}";
+  int code = postJson(INJECTION_EVENT_URL, body, resp);
+  Serial.println("[inj] " + String(firing ? "FIRING" : "idle") + " shot#" + String(shots) + " -> code=" + String(code));
+}
+
 void checkOTA() {
   if (WiFi.status() != WL_CONNECTED) return;
   WiFiClientSecure client; client.setInsecure();
@@ -235,6 +290,7 @@ void checkOTA() {
     if (targeted && versionNewer(remoteVer, FW_VERSION)) {
       Serial.println("[ota] " + String(FW_VERSION) + " -> " + remoteVer + " ... downloading");
       http.end();
+      if (injectionArmed) detachInterrupt(digitalPinToInterrupt(INJECTION_PIN)); // no ISR during flash write
       WiFiClientSecure up; up.setInsecure();
       httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
       t_httpUpdate_return r = httpUpdate.update(up, FIRMWARE_URL);
@@ -499,6 +555,19 @@ void setup() {
     Serial.println("[id] MISSING IDENTITY - flash with DEVICE_ID/DEVICE_KEY set once");
 
   startRC522();
+
+  // Injection monitoring: ARM only on machine 7 (matched by device id). GPIO 4 taps the injection
+  // machine's firing signal through a PC817 optocoupler. INPUT_PULLUP, active-high (HIGH = firing),
+  // edge-triggered so a shot is caught even while the loop is busy with a blocking HTTP post.
+  if (deviceId == INJECTION_DEVICE_ID) {
+    pinMode(INJECTION_PIN, INPUT_PULLUP);
+    injectionFiring = (digitalRead(INJECTION_PIN) == HIGH);   // establish baseline, fire no event
+    attachInterrupt(digitalPinToInterrupt(INJECTION_PIN), injectionISR, CHANGE);
+    injectionArmed = true;
+    Serial.println("[inj] ARMED on GPIO " + String(INJECTION_PIN) + " (machine 7) - baseline " +
+                   String(injectionFiring ? "HIGH/firing" : "LOW/idle"));
+  }
+
   Serial.println("========================================");
 
   lastHeartbeatAt = millis() - HEARTBEAT_INTERVAL;
@@ -554,5 +623,15 @@ void loop() {
   if (now - lastStatusAt >= STATUS_INTERVAL) {
     lastStatusAt = now;
     printStatus();
+  }
+
+  // Injection state change (machine 7 only): the GPIO 4 ISR flags it; post it promptly.
+  if (injectionArmed && injectionChanged) {
+    noInterrupts();
+    bool firing = injectionFiring;
+    unsigned long shots = injectionShotCount;
+    injectionChanged = false;
+    interrupts();
+    postInjectionEvent(firing, shots);
   }
 }
