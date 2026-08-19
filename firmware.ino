@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.54"
+#define FW_VERSION "1.0.55"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -406,6 +406,14 @@ void printStatus() {
                  "  READER=" + reader +
                  "  tag=" + tag +
                  "  wifi=" + wifi);
+  // Live injection view (machine 7 only): raw GPIO 4 level + tracked state + shot count, so the pin
+  // can be watched changing while the machine fires - the fastest way to tell wiring from logic.
+  if (injectionArmed) {
+    Serial.println("[inj] GPIO" + String(INJECTION_PIN) + " reads " +
+                   String(digitalRead(INJECTION_PIN) == HIGH ? "HIGH/firing" : "LOW/idle") +
+                   "  tracked=" + String(injectionFiring ? "firing" : "idle") +
+                   "  shots=" + String(injectionShotCount));
+  }
 }
 
 // Set the antenna P/N driver strength (field power). Only the low-power "close tag" probe
@@ -559,13 +567,18 @@ void setup() {
   // Injection monitoring: ARM only on machine 7 (matched by device id). GPIO 4 taps the injection
   // machine's firing signal through a PC817 optocoupler. INPUT_PULLUP, active-high (HIGH = firing),
   // edge-triggered so a shot is caught even while the loop is busy with a blocking HTTP post.
-  if (deviceId == INJECTION_DEVICE_ID) {
+  // Arm on machine 7 by BOARD NUMBER *or* device id - so a device-id that doesn't exactly match
+  // identities.txt can't leave injection silently dormant (that would look exactly like "online,
+  // 1.0.54, but zero injection events ever"). Board 7 reports boardNum 7, so this reliably arms it.
+  if (boardNum == 7 || deviceId == INJECTION_DEVICE_ID) {
     pinMode(INJECTION_PIN, INPUT_PULLUP);
     injectionFiring = (digitalRead(INJECTION_PIN) == HIGH);   // establish baseline, fire no event
     attachInterrupt(digitalPinToInterrupt(INJECTION_PIN), injectionISR, CHANGE);
     injectionArmed = true;
-    Serial.println("[inj] ARMED on GPIO " + String(INJECTION_PIN) + " (machine 7) - baseline " +
-                   String(injectionFiring ? "HIGH/firing" : "LOW/idle"));
+    Serial.println("[inj] ARMED on GPIO " + String(INJECTION_PIN) + " (board #" + String(boardNum) +
+                   ") - baseline " + String(injectionFiring ? "HIGH/firing" : "LOW/idle"));
+  } else {
+    Serial.println("[inj] NOT armed - board #" + String(boardNum) + " is not machine 7 (dormant)");
   }
 
   Serial.println("========================================");
