@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.58"
+#define FW_VERSION "1.0.59"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -289,6 +289,37 @@ void postMachineSignal(const char* name, bool active, unsigned long shots) {
   int code = postJson(MACHINE_EVENT_URL, body, resp);
   Serial.println("[mach] " + String(name) + " " + String(active ? "ACTIVE" : "idle") +
                  " shot#" + String(shots) + " -> code=" + String(code));
+}
+
+// Boot continuity probe (machine 7). For each signal pin, sample it under an internal pull-UP, then
+// under an internal pull-DOWN. A pin that FOLLOWS the pull (HIGH with pull-up, LOW with pull-down)
+// has nothing on the optocoupler output driving it -> that channel's OUTPUT side isn't wired to the
+// ESP (missing 3V3 collector rail and/or common ground). A pin that reads the SAME level under both
+// pulls is being actively DRIVEN -> a live connection. This runs with the machine idle and nobody at
+// the board, and posts one row per channel so the wiring can be checked purely from the backend.
+// The known-good ejecting_forward channel is the reference: it should report "driven" (live).
+void probeMachineInputs() {
+  for (int i = 0; i < NUM_SIGNALS; i++) {
+    pinMode(machineSignals[i].pin, INPUT_PULLUP);
+    delay(3);
+    bool up = (digitalRead(machineSignals[i].pin) == HIGH);
+    pinMode(machineSignals[i].pin, INPUT_PULLDOWN);
+    delay(3);
+    bool down = (digitalRead(machineSignals[i].pin) == HIGH);
+    const char* verdict;
+    if      ( up && !down) verdict = "floating";     // follows the pull -> output side not connected
+    else if ( up &&  down) verdict = "driven_high";  // held HIGH against a pull-down -> live 3V3 source
+    else if (!up && !down) verdict = "driven_low";   // held LOW against a pull-up  -> live GND sink
+    else                   verdict = "noisy";        // !up && down -> unstable/floating, treat as suspect
+    Serial.println("[probe] " + String(machineSignals[i].name) + " gpio" + String(machineSignals[i].pin) +
+                   " up=" + String(up) + " down=" + String(down) + " -> " + verdict);
+    // Land it in machine_events via the same auth/endpoint; encode the verdict in the state field.
+    String resp;
+    String body = String("{\"signal\":\"") + machineSignals[i].name +
+                  "\",\"state\":\"probe_" + verdict +
+                  "\",\"shot_count\":0,\"uptime_ms\":" + String(millis()) + "}";
+    postJson(MACHINE_EVENT_URL, body, resp);
+  }
 }
 
 void checkOTA() {
@@ -593,6 +624,8 @@ void setup() {
   // HTTP post. Arm by BOARD NUMBER *or* device id - so a device-id that doesn't exactly match
   // identities.txt can't leave monitoring silently dormant. Board 7 reports boardNum 7, so it arms.
   if (boardNum == 7 || deviceId == INJECTION_DEVICE_ID) {
+    // Continuity probe FIRST (before interrupts are attached): reports live vs floating per channel.
+    probeMachineInputs();
     for (int i = 0; i < NUM_SIGNALS; i++) {
       pinMode(machineSignals[i].pin, INPUT_PULLDOWN);
       sigState[i]      = (digitalRead(machineSignals[i].pin) == HIGH);  // baseline, fire no event
