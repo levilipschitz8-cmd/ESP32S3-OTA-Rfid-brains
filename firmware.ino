@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.63"
+#define FW_VERSION "1.0.64"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -60,7 +60,7 @@ MachineSignal machineSignals[] = {
   {  6, "mould_opening",    false },   // raw_levels pos 2 - terminal 109  (confirmed working)
   {  7, "ejecting_forward", false },   // raw_levels pos 3 - terminal 110
   { 15, "carriage_forward", false },   // raw_levels pos 4 - terminal 104
-  { 16, "charge",           false },   // raw_levels pos 5 - terminal 106  (plasticizing / screw recovery)
+  { 21, "charge",           false },   // raw_levels pos 5 - terminal 106  (plasticizing / screw recovery); moved off GPIO16
   { 40, "carriage_back",    false },   // raw_levels pos 6 - terminal 108
   { 41, "ejecting_back",    false },   // raw_levels pos 7 - terminal 111
 };
