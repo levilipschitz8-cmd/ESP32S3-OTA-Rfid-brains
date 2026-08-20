@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.64"
+#define FW_VERSION "1.0.65"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -227,6 +227,181 @@ bool writeTagBlock(int block, const String& data, String& detail) {
   return ok;
 }
 
+// ================= NDEF (NTAG21x) writing for bin tags =================
+// Build a well-formed NDEF message (optional URI record + optional Text record), wrap it in the NTAG
+// NDEF Message TLV, and write it to user memory from page 4 with plain page writes (NTAG/Ultralight,
+// SAK 0x00, has no Classic key auth). Then read the pages back and decode the text so a write can be
+// verified end-to-end. The existing Classic write_tag path is untouched.
+
+String jsonEscape(const String& s) {
+  String o = "";
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '"' || c == '\\') { o += '\\'; o += c; }
+    else if (c == '\n') o += "\\n";
+    else if (c == '\r') o += "\\r";
+    else if (c == '\t') o += "\\t";
+    else if ((unsigned char)c >= 0x20) o += c;   // drop other control chars
+  }
+  return o;
+}
+
+String tagTypeName(byte sak) {
+  if (sak == 0x00) return "NTAG/Ultralight";
+  if (sak == 0x08) return "MIFARE Classic 1K";
+  if (sak == 0x18) return "MIFARE Classic 4K";
+  if (sak == 0x09) return "MIFARE Mini";
+  if (sak & 0x20)  return "ISO14443-4";
+  return "SAK 0x" + String(sak, HEX);
+}
+
+// NFC Forum URI RTD prefix abbreviations - trims the matched prefix from uri and returns its code.
+byte uriPrefixCode(String& uri) {
+  const char* pfx[]  = {"https://www.", "http://www.", "https://", "http://"};
+  const byte  code[] = {0x02,            0x01,          0x04,        0x03};
+  for (int i = 0; i < 4; i++) {
+    if (uri.startsWith(pfx[i])) { uri = uri.substring(strlen(pfx[i])); return code[i]; }
+  }
+  return 0x00;   // no abbreviation -> store the whole URI
+}
+
+// Assemble the NDEF message (records only, no TLV) into buf. Returns length, or -1 if empty/too big.
+int buildNdefMessage(const String& url, const String& text, byte* buf, int cap) {
+  bool hasUri  = url.length()  > 0;
+  bool hasText = text.length() > 0;
+  if (!hasUri && !hasText) return -1;
+  int n = 0;
+  if (hasUri) {                                        // URI record ('U')
+    String u = url; byte c = uriPrefixCode(u);
+    int payLen = 1 + u.length();
+    if (payLen > 255 || n + 4 + payLen > cap) return -1;
+    byte hdr = 0x80 | 0x10 | 0x01;                     // MB | SR | TNF=well-known
+    if (!hasText) hdr |= 0x40;                          // ME if also the last record
+    buf[n++] = hdr; buf[n++] = 1; buf[n++] = (byte)payLen; buf[n++] = 'U'; buf[n++] = c;
+    for (unsigned int i = 0; i < u.length(); i++) buf[n++] = (byte)u[i];
+  }
+  if (hasText) {                                       // Text record ('T'), lang "en"
+    int payLen = 1 + 2 + text.length();
+    if (payLen > 255 || n + 4 + payLen > cap) return -1;
+    byte hdr = 0x40 | 0x10 | 0x01;                     // ME | SR | TNF=well-known
+    if (!hasUri) hdr |= 0x80;                           // MB if first record
+    buf[n++] = hdr; buf[n++] = 1; buf[n++] = (byte)payLen; buf[n++] = 'T';
+    buf[n++] = 0x02; buf[n++] = 'e'; buf[n++] = 'n';    // status (UTF-8, lang len 2) + "en"
+    for (unsigned int i = 0; i < text.length(); i++) buf[n++] = (byte)text[i];
+  }
+  return n;
+}
+
+// Scan up to `ms` for a tag and select it (fills mfrc522.uid). WakeupA so a tag already sitting on the
+// reader is caught, not only a freshly-arrived one. Returns true if a tag was selected.
+bool selectTagWithin(unsigned long ms) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < ms) {
+    byte atqa[2]; byte sz = sizeof(atqa);
+    mfrc522.PCD_WriteRegister(mfrc522.TxModeReg, 0x00);
+    mfrc522.PCD_WriteRegister(mfrc522.RxModeReg, 0x00);
+    mfrc522.PCD_WriteRegister(mfrc522.ModWidthReg, 0x26);
+    MFRC522::StatusCode s = mfrc522.PICC_WakeupA(atqa, &sz);
+    if ((s == MFRC522::STATUS_OK || s == MFRC522::STATUS_COLLISION) && mfrc522.PICC_ReadCardSerial())
+      return true;
+    delay(50);
+  }
+  return false;
+}
+
+// Decode the first NDEF Text record from a page buffer; fall back to the URI record's URI. "" if none.
+String decodeNdefText(const byte* d, int len) {
+  int i = 0, msgLen = -1, msgStart = -1;
+  while (i < len) {                                    // find the NDEF Message TLV (0x03)
+    byte t = d[i++];
+    if (t == 0x00) continue;                            // NULL TLV
+    if (t == 0xFE) break;                               // terminator
+    if (i >= len) break;
+    int l = d[i++];
+    if (l == 0xFF) { if (i + 1 >= len) break; l = (d[i] << 8) | d[i+1]; i += 2; }
+    if (t == 0x03) { msgLen = l; msgStart = i; break; }
+    i += l;
+  }
+  if (msgStart < 0) return "";
+  int p = msgStart, end = msgStart + msgLen;
+  if (end > len) end = len;
+  String uriOut = "";
+  while (p < end) {                                     // walk the records
+    byte hdr = d[p++]; bool sr = hdr & 0x10; bool il = hdr & 0x08;
+    if (p >= end) break;
+    int typeLen = d[p++];
+    long payLen;
+    if (sr) payLen = d[p++];
+    else { if (p + 3 >= end) break; payLen = ((long)d[p]<<24)|((long)d[p+1]<<16)|((long)d[p+2]<<8)|d[p+3]; p += 4; }
+    int idLen = 0; if (il) { if (p >= end) break; idLen = d[p++]; }
+    if (p + typeLen > end) break;
+    char type = (typeLen >= 1) ? (char)d[p] : 0;
+    p += typeLen + idLen;
+    if (p + payLen > end) payLen = end - p;
+    if (type == 'T' && payLen >= 1) {
+      int langLen = d[p] & 0x3F;
+      int txtStart = p + 1 + langLen, txtLen = payLen - 1 - langLen;
+      String out = "";
+      for (int k = 0; k < txtLen && txtStart + k < end; k++) out += (char)d[txtStart + k];
+      return out;                                       // prefer the text record
+    }
+    if (type == 'U' && payLen >= 1 && uriOut.length() == 0) {
+      const char* pfx = "";
+      switch (d[p]) { case 0x01: pfx="http://www."; break; case 0x02: pfx="https://www."; break;
+                      case 0x03: pfx="http://"; break; case 0x04: pfx="https://"; break; }
+      String u = pfx;
+      for (int k = 1; k < payLen && p + k < end; k++) u += (char)d[p + k];
+      uriOut = u;
+    }
+    p += payLen;
+  }
+  return uriOut;
+}
+
+bool writeNdefTag(const String& url, const String& text, String& detail, String& readBack) {
+  if (!rc522Ok) { detail = "reader not detected"; return false; }
+  if (!selectTagWithin(2000)) { detail = "no tag on reader (2s scan)"; return false; }
+  String ttype = tagTypeName(mfrc522.uid.sak);
+  if (mfrc522.uid.sak != 0x00) {                        // Classic goes through write_tag, not here
+    detail = "not an NTAG (type=" + ttype + ", sak=0x" + String(mfrc522.uid.sak, HEX) + ")";
+    mfrc522.PICC_HaltA(); return false;
+  }
+  byte msg[240];
+  int mlen = buildNdefMessage(url, text, msg, sizeof(msg));
+  if (mlen < 0) { detail = "ndef empty or too large (type=" + ttype + ")"; mfrc522.PICC_HaltA(); return false; }
+  byte tlv[248]; int tn = 0;
+  tlv[tn++] = 0x03; tlv[tn++] = (byte)mlen;             // NDEF Message TLV + 1-byte length (<255 here)
+  for (int i = 0; i < mlen; i++) tlv[tn++] = msg[i];
+  tlv[tn++] = 0xFE;                                     // terminator TLV
+  while (tn % 4 != 0) tlv[tn++] = 0x00;                 // pad to whole pages
+  int pages = tn / 4;
+  for (int pg = 0; pg < pages; pg++) {
+    byte page[4] = { tlv[pg*4], tlv[pg*4+1], tlv[pg*4+2], tlv[pg*4+3] };
+    if (mfrc522.MIFARE_Ultralight_Write((byte)(4 + pg), page, 4) != MFRC522::STATUS_OK) {
+      detail = "ntag write failed at page " + String(4 + pg) + " (type=" + ttype + ")";
+      mfrc522.PICC_HaltA(); return false;
+    }
+  }
+  byte back[256]; int backLen = 0;
+  for (int pg = 0; pg < pages + 2 && backLen + 16 <= (int)sizeof(back); pg += 4) {
+    byte b[18]; byte bl = sizeof(b);
+    if (mfrc522.MIFARE_Read((byte)(4 + pg), b, &bl) != MFRC522::STATUS_OK) break;
+    for (int k = 0; k < 16; k++) back[backLen++] = b[k];
+  }
+  mfrc522.PICC_HaltA();
+  readBack = decodeNdefText(back, backLen);
+  detail = "wrote+verified NDEF (" + String(pages) + " pages, type=" + ttype + ")";
+  return true;
+}
+
+void postCommandResultNdef(const String& cmdId, const String& status, const String& detail, const String& readBack) {
+  String resp;
+  String body = "{\"command_id\":\"" + cmdId + "\",\"status\":\"" + status +
+                "\",\"detail\":\"" + jsonEscape(detail) + "\",\"read_back\":\"" + jsonEscape(readBack) + "\"}";
+  int code = postJson(CMD_RESULT_URL, body, resp);
+  Serial.println("[cmd] ndef " + status + " read_back='" + readBack + "' -> code=" + String(code));
+}
+
 void handleCommand(const String& resp) {
   String cmd = jsonStr(resp, "command");
   if (cmd == "" || cmd == "null") return;
@@ -238,6 +413,13 @@ void handleCommand(const String& resp) {
     String detail;
     bool ok = writeTagBlock(block, data, detail);
     postCommandResult(cmdId, ok ? "ok" : "fail", detail);
+  } else if (cmd == "write_ndef") {
+    String url  = jsonStr(resp, "url");
+    String text = jsonStr(resp, "text");
+    Serial.println("[cmd] write_ndef id=" + cmdId + " url=" + url + " text=" + text);
+    String detail, readBack;
+    bool ok = writeNdefTag(url, text, detail, readBack);
+    postCommandResultNdef(cmdId, ok ? "ok" : "fail", detail, readBack);
   } else {
     postCommandResult(cmdId, "fail", "unknown command");
   }
