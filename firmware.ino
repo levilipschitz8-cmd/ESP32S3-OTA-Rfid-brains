@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.74"
+#define FW_VERSION "1.0.75"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -463,7 +463,7 @@ void handleCommand(const String& resp) {
     cycleAntenna(250);
     startRC522();
     reprobeCount = 0; emptySince = 0;
-    String found = readTagUid();
+    String found = sweepRead();                     // full + low-power dip: finds an over-coupled close tag too
     String detail = rc522Ok ? ("reader re-inited (v0x" + String(lastReaderVersion, HEX) + ")")
                             : "reader still not detected";
     if (found != "" && found != currentUID) { adoptTag(found); }
@@ -839,6 +839,20 @@ void adoptTag(const String& newUid) {
 String readTagUid() {
   String u = "";
   for (int a = 0; a < 5 && u == ""; a++) u = tryReadOnce();
+  return u;
+}
+
+// Full "probe sweep" read for on-demand recovery: FULL power first (a distance tag reads here), then a
+// LOW-power dip (a close tag that OVER-COUPLES the strong field only answers weak), then snap back to
+// full. Same sweep the detect/hold paths use, packaged so a backend recover_reader finds an over-coupled
+// close tag too - not just a plain full-power read.
+String sweepRead() {
+  String u = readTagUid();                          // full power (5 tries)
+  if (u == "") {
+    setAntennaDrive(0x44, 0x10, 0x10);              // low-power dip for an over-coupled close tag
+    for (int a = 0; a < 3 && u == ""; a++) u = tryReadOnce();
+    setAntennaDrive(0xFF, 0x3F, 0x3F);              // restore full drive
+  }
   return u;
 }
 
