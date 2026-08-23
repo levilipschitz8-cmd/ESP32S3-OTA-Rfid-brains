@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.75"
+#define FW_VERSION "1.0.76"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -72,8 +72,6 @@ volatile unsigned long injectionShotCount = 0;      // shots (injection idle->ac
 unsigned long          lastShotSaved = 0;           // last shot value written to NVS (throttle flash writes)
 const unsigned long INJECTION_DEBOUNCE_US = 40000;  // 40 ms debounce per channel
 String currentUID = "";
-bool          assertPresentPending = false;  // re-post "present" for a restored tag once the network is up
-int           wedgeReboots = 0;              // reboots already spent trying to un-wedge the current reader
 byte lastReaderVersion = 0;             // last RC522 version byte read (for the status line)
 unsigned long lastSeenAt = 0;
 unsigned long lastHeartbeatAt = 0;
@@ -117,18 +115,6 @@ const unsigned long REMOVE_CONFIRM_MS    = 20000;    // A HEALTHY reader must se
                                                      // wedged/down reader never counts toward removal - it
                                                      // holds the tag and recovers. Real removal still
                                                      // clears within ~20s of the field actually going empty.
-const int          MAX_WEDGE_REBOOTS     = 3;        // reboots to spend un-wedging a reader before giving up
-                                                     // the reboot lever (then just HOLD present + let the
-                                                     // backend/human handle a truly dead reader - no loop).
-const unsigned long REBOOT_RECOVER_MS    = 120000;   // A held tag that stops answering for this long, AFTER
-                                                     // antenna re-seat + full reader re-init have both been
-                                                     // tried and failed, is a WEDGED reader (not a real
-                                                     // removal - a held tag is treated as permanent here).
-                                                     // Reboot to recover: the same clean reset an OTA update
-                                                     // does, the one thing observed to bring a dead reader
-                                                     // back. Fires at most once per episode (after reboot
-                                                     // currentUID is empty, so the detect loop re-finds the
-                                                     // tag - no reboot-loop, and no false "removed").
 const unsigned long REPROBE_AFTER_MS     = 2000;     // when a tracked tag stops answering, cycle the antenna
                                                      // (drop+re-apply the field = "software re-seat" the tag)
                                                      // at most this often, before the empty window can run
@@ -463,7 +449,7 @@ void handleCommand(const String& resp) {
     cycleAntenna(250);
     startRC522();
     reprobeCount = 0; emptySince = 0;
-    String found = sweepRead();                     // full + low-power dip: finds an over-coupled close tag too
+    String found = readTagUid();
     String detail = rc522Ok ? ("reader re-inited (v0x" + String(lastReaderVersion, HEX) + ")")
                             : "reader still not detected";
     if (found != "" && found != currentUID) { adoptTag(found); }
@@ -483,8 +469,6 @@ void handleCommand(const String& resp) {
       String had = currentUID;
       postTagEvent(currentUID, "removed");
       currentUID = ""; emptySince = 0;
-      saveHeldTag("");                          // human said the bin is really gone -> forget it across reboots
-      wedgeReboots = 0; saveWedgeReboots(0);
       postCommandResult(cmdId, "ok", "cleared " + had);
     }
   } else {
@@ -789,49 +773,11 @@ void cycleAntenna(unsigned long offMs) {
   delay(8);
 }
 
-// --- Held-tag persistence (NVS) ---------------------------------------------------------------------
-// A bin tag is permanent, so it must survive a reboot (OTA update or self-heal). Save the held UID
-// whenever it changes; restore it at boot so the board comes back already HOLDING the tag instead of
-// starting blank in "detect" mode (where a reader that can't instantly re-read it would show "removed").
-void saveHeldTag(const String& uid) {
-  prefs.begin("tag", false);
-  prefs.putString("uid", uid);
-  prefs.end();
-}
-String loadHeldTag() {
-  prefs.begin("tag", true);
-  String u = prefs.getString("uid", "");
-  prefs.end();
-  return u;
-}
-void saveWedgeReboots(int n) {
-  prefs.begin("tag", false);
-  prefs.putInt("wreb", n);
-  prefs.end();
-}
-int loadWedgeReboots() {
-  prefs.begin("tag", true);
-  int n = prefs.getInt("wreb", 0);
-  prefs.end();
-  return n;
-}
-// Every point where a REAL read confirms the held tag: mark it seen, clear the empty window, and reset
-// the wedge-reboot budget (the reader has proven it can read, so future transients get a fresh set of
-// recovery reboots).
-void confirmPresent() {
-  lastSeenAt = millis();
-  emptySince = 0;
-  reprobeCount = 0;
-  if (wedgeReboots != 0) { wedgeReboots = 0; saveWedgeReboots(0); }
-}
-
 // Switch the tracked tag to a newly-seen UID (a swap): report the old one removed and the new present.
 void adoptTag(const String& newUid) {
   Serial.println("Tag swapped: " + currentUID + " -> " + newUid);
   postTagEvent(currentUID, "removed");
   currentUID = newUid; lastSeenAt = millis(); emptySince = 0;
-  saveHeldTag(currentUID);
-  if (wedgeReboots != 0) { wedgeReboots = 0; saveWedgeReboots(0); }
   postTagEvent(currentUID, "present");
 }
 
@@ -839,20 +785,6 @@ void adoptTag(const String& newUid) {
 String readTagUid() {
   String u = "";
   for (int a = 0; a < 5 && u == ""; a++) u = tryReadOnce();
-  return u;
-}
-
-// Full "probe sweep" read for on-demand recovery: FULL power first (a distance tag reads here), then a
-// LOW-power dip (a close tag that OVER-COUPLES the strong field only answers weak), then snap back to
-// full. Same sweep the detect/hold paths use, packaged so a backend recover_reader finds an over-coupled
-// close tag too - not just a plain full-power read.
-String sweepRead() {
-  String u = readTagUid();                          // full power (5 tries)
-  if (u == "") {
-    setAntennaDrive(0x44, 0x10, 0x10);              // low-power dip for an over-coupled close tag
-    for (int a = 0; a < 3 && u == ""; a++) u = tryReadOnce();
-    setAntennaDrive(0xFF, 0x3F, 0x3F);              // restore full drive
-  }
   return u;
 }
 
@@ -868,7 +800,7 @@ void pollRfid() {
 
     // Read the tag at FULL power: confirms the exact UID and catches a swap to a different tag.
     String seen = readTagUid();
-    if (seen == currentUID) { confirmPresent(); return; }  // present
+    if (seen == currentUID) { lastSeenAt = millis(); emptySince = 0; reprobeCount = 0; return; }  // present
     if (seen != "") { adoptTag(seen); reprobeCount = 0; return; }                 // a different tag -> swap
     // LOW-POWER dip: a STRONG reader OVER-couples a CLOSE tag at full power and can't read it - it needs
     // a weaker field. This is the probe-style sweep applied to the PRESENCE check (not just detection),
@@ -877,10 +809,10 @@ void pollRfid() {
     setAntennaDrive(0x44, 0x10, 0x10);
     String low = readTagUid();
     setAntennaDrive(0xFF, 0x3F, 0x3F);
-    if (low == currentUID) { confirmPresent(); return; }  // present (close)
+    if (low == currentUID) { lastSeenAt = millis(); emptySince = 0; reprobeCount = 0; return; }  // present (close)
     if (low != "") { adoptTag(low); reprobeCount = 0; return; }                   // a different close tag -> swap
     // A weakly-coupled tag may still answer a bare field ping even when it can't complete a select.
-    if (tagAnswersField()) { confirmPresent(); return; }
+    if (tagAnswersField()) { lastSeenAt = millis(); emptySince = 0; reprobeCount = 0; return; }
 
     // No answer this pass. Before letting the removal window run, ESCALATE recovery: short antenna
     // blink -> longer blink -> full reader re-init. A sitting tag that has gone unresponsive answers
@@ -893,31 +825,13 @@ void pollRfid() {
       else if (reprobeCount <= 5) cycleAntenna(250);    // longer field-off -> fully drains a stubborn tag
       else { startRC522(); reprobeCount = 0; }          // heaviest: full reader re-init, then start over
       String again = readTagUid();
-      if (again == currentUID || (again == "" && tagAnswersField())) { confirmPresent(); return; }
+      if (again == currentUID || (again == "" && tagAnswersField())) { lastSeenAt = millis(); emptySince = 0; reprobeCount = 0; return; }
       if (again != "") { adoptTag(again); reprobeCount = 0; return; }
     }
-    // Terminal escalation. We do NOT post "removed" from an empty field - on these readers a held tag is
-    // permanent, so a silent no-read is a WEDGED reader, and a false "removed"/stale is exactly what must
-    // never appear. A real change of tag is still caught above (adoptTag on a different UID = swap). If the
-    // held tag has not answered for REBOOT_RECOVER_MS despite every lighter recovery, reboot to recover the
-    // reader - the same clean reset an OTA update does. Fires at most once per episode: after the reboot
-    // currentUID is empty, so the detect loop (not this path) re-finds a tag that is really still there, and
-    // a genuinely-removed tag is simply not re-found - it never produces a false "removed".
-    if (millis() - emptySince > REBOOT_RECOVER_MS) {
-      if (wedgeReboots < MAX_WEDGE_REBOOTS) {
-        wedgeReboots++; saveWedgeReboots(wedgeReboots);
-        Serial.println("[wedge] held tag unconfirmed " + String(REBOOT_RECOVER_MS / 1000) +
-                       "s - reboot " + String(wedgeReboots) + "/" + String(MAX_WEDGE_REBOOTS) +
-                       " to recover reader (tag stays HELD, not removed): " + currentUID);
-        delay(50);
-        ESP.restart();                         // tag is persisted -> we come back HOLDING it, not blank
-      } else {
-        // Reboots didn't bring the reader back -> hardware wedge, not a soft lockup. Stop reboot-looping:
-        // keep HOLDING the tag as present (still never "removed"), keep the light in-place recovery
-        // running, and leave it for the backend recover_reader loop / a human. The budget resets the
-        // instant the reader reads the tag again (confirmPresent).
-        emptySince = millis();
-      }
+    if (millis() - emptySince > REMOVE_CONFIRM_MS) {
+      Serial.println("Tag removed (field empty " + String(REMOVE_CONFIRM_MS / 1000) + "s): " + currentUID);
+      postTagEvent(currentUID, "removed");
+      currentUID = ""; emptySince = 0;
     }
     return;
   }
@@ -955,8 +869,7 @@ void pollRfid() {
   }
   if (uid != "") {
     currentUID = uid;
-    confirmPresent();
-    saveHeldTag(currentUID);                   // persist so a reboot never forgets this tag
+    lastSeenAt = millis();
     Serial.println("Tag present: " + currentUID);
     postTagEvent(currentUID, "present");
   }
@@ -997,19 +910,6 @@ void setup() {
     Serial.println("[id] MISSING IDENTITY - flash with DEVICE_ID/DEVICE_KEY set once");
 
   startRC522();
-
-  // Restore the held tag across reboots. A bin tag is permanent, so a reboot (OTA update or self-heal)
-  // must NOT drop it into "detect" mode where a reader that can't instantly re-read it would show
-  // "removed". Come back up already HOLDING it: the never-remove hold path is in force from the first
-  // second, and we re-assert "present" as soon as the network is up. clear_tag (human "bin gone") wipes it.
-  wedgeReboots = loadWedgeReboots();
-  currentUID = loadHeldTag();
-  if (currentUID != "") {
-    lastSeenAt = millis(); emptySince = 0;
-    assertPresentPending = true;
-    Serial.println("[tag] restored held tag across reboot: " + currentUID +
-                   " (wedgeReboots=" + String(wedgeReboots) + ")");
-  }
 
   // Machine monitoring: ARM only on machine 7 (matched by board number OR device id). Seven PC817
   // optocoupler taps of the moulding machine's signals, all ACTIVE-LOW with INPUT_PULLUP: an idle or
@@ -1076,14 +976,6 @@ void loop() {
   if (now - lastHeartbeatAt >= HEARTBEAT_INTERVAL) {
     lastHeartbeatAt = now;
     sendHeartbeat();
-  }
-
-  // A tag restored from flash after a reboot: re-assert "present" once the network is up, so the
-  // dashboard flips off any stale "removed" from before the reboot. One post, then cleared.
-  if (assertPresentPending && everConnected && WiFi.status() == WL_CONNECTED && currentUID != "") {
-    postTagEvent(currentUID, "present");
-    assertPresentPending = false;
-    Serial.println("[tag] re-asserted present after reboot: " + currentUID);
   }
 
   if (now - lastReaderCheckAt >= READER_CHECK_INTERVAL) {
