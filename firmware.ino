@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.70"
+#define FW_VERSION "1.0.71"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -88,6 +88,7 @@ unsigned long lastRefreshAt = 0;       // last proactive field-refresh blink whi
 int           reprobeCount = 0;        // escalating recovery step count for the held tag
 unsigned long lastLevelSnapAt = 0;      // last raw pin-level snapshot POST (machine 7 diagnostic)
 unsigned long lastRawPrintAt = 0;       // last 1 Hz RAW serial print (machine 7 diagnostic)
+unsigned long lastReinitAt = 0;         // last FULL reader re-init while hunting for a tag (auto-recovery)
 
 const unsigned long HEARTBEAT_INTERVAL   = 5000;
 const unsigned long RFID_POLL_INTERVAL   = 250;
@@ -97,6 +98,11 @@ const unsigned long OTA_CHECK_INTERVAL   = 60000;    // 60s
 const unsigned long READER_CHECK_INTERVAL = 3000;    // hot-plug re-check
 const unsigned long STATUS_INTERVAL      = 2000;     // print a clear per-board status line this often
 const unsigned long CLOSE_PROBE_INTERVAL = 1000;     // how often (max) to dip to low power for a close tag
+const unsigned long REINIT_INTERVAL      = 8000;     // while hunting for a tag, FULLY re-init the reader
+                                                     // (RST + PCD_Init + config, same as a reboot) this
+                                                     // often - recovers an "answers but won't read" wedge
+                                                     // that antenna blinks and serviceReader can't, so a
+                                                     // stuck reader self-heals instead of staying "removed".
 const unsigned long FIELD_REFRESH_INTERVAL = 20000;  // while a tag is present, proactively blink the field
                                                      // this often so it never sits in a continuous field
                                                      // long enough to go unresponsive (prevents sticking).
@@ -831,6 +837,14 @@ void pollRfid() {
     // Still nothing: a tag may be sitting there but gone unresponsive. Blink the field to re-seat it,
     // then re-read - this re-finds a tag that had wrongly gone "removed" without anyone touching it.
     if (uid == "") { cycleAntenna(120); uid = readTagUid(); }
+    // STILL nothing: periodically do a FULL reader re-init - the same reset a reboot does. This is what
+    // recovers a reader that answers on SPI but has stopped reading (the wedge that stays "removed" and
+    // never self-heals), so the board recovers on its own instead of needing a replug.
+    if (uid == "" && millis() - lastReinitAt >= REINIT_INTERVAL) {
+      lastReinitAt = millis();
+      startRC522();
+      uid = readTagUid();
+    }
   }
   if (uid != "") {
     currentUID = uid;
