@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.65"
+#define FW_VERSION "1.0.66"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -82,6 +82,8 @@ unsigned long lastReaderCheckAt = 0;
 unsigned long lastStatusAt = 0;         // last time we printed the human status line
 unsigned long lastCloseProbeAt = 0;     // last low-power "close tag" probe while searching
 unsigned long lastGoodContactAt = 0;   // last successful (200) heartbeat
+unsigned long emptySince = 0;          // when a HEALTHY reader first saw an empty field (0 = not empty)
+unsigned long lastReprobeAt = 0;       // last hard RST re-probe while holding a tracked tag
 unsigned long lastLevelSnapAt = 0;      // last raw pin-level snapshot POST (machine 7 diagnostic)
 unsigned long lastRawPrintAt = 0;       // last 1 Hz RAW serial print (machine 7 diagnostic)
 
@@ -94,11 +96,17 @@ const unsigned long READER_CHECK_INTERVAL = 3000;    // hot-plug re-check
 const unsigned long STATUS_INTERVAL      = 2000;     // print a clear per-board status line this often
 const unsigned long CLOSE_PROBE_INTERVAL = 1000;     // how often (max) to dip to low power for a close tag
 const unsigned long OFFLINE_REBOOT_TIMEOUT = 60000;  // no server contact for 60s -> self-reboot
-const unsigned long REMOVE_TIMEOUT       = 3500;     // ~3.5s of continuous no-see before "removed".
-                                                     // A sitting tag near the edge of range can fail a
-                                                     // strict re-read for a moment; a short timeout turned
-                                                     // that into a false "removed". 3.5s rides through the
-                                                     // brief misses; a genuinely removed tag still clears.
+const unsigned long REMOVE_CONFIRM_MS    = 20000;    // A HEALTHY reader must see a genuinely EMPTY field
+                                                     // this long, CONTINUOUSLY, before a tracked tag is
+                                                     // declared removed. A tag physically on the reader
+                                                     // answers the field ping every poll and resets this,
+                                                     // so it stays "present" indefinitely (months). A
+                                                     // wedged/down reader never counts toward removal - it
+                                                     // holds the tag and recovers. Real removal still
+                                                     // clears within ~20s of the field actually going empty.
+const unsigned long REPROBE_AFTER_MS     = 5000;     // after this long with no answer, hard RST re-probe the
+                                                     // reader (un-sticks a jammed RF front-end) before the
+                                                     // empty window is allowed to run toward removal.
 
 void resolveIdentity() {
   prefs.begin("ident", false);
@@ -702,28 +710,59 @@ bool isTagStillPresent() {
 }
 
 void pollRfid() {
-  if (!rc522Ok) {
-    // Reader is down (wedged/lost). If a tag was being tracked, clear it after the timeout so
-    // it doesn't stay stuck "present" while the reader is dead - serviceReader is re-initing
-    // the reader in the background to bring it back.
-    if (currentUID != "" && millis() - lastSeenAt > REMOVE_TIMEOUT) {
-      Serial.println("Tag removed: " + currentUID + " (reader down)");
-      postTagEvent(currentUID, "removed");
-      currentUID = "";
-    }
-    return;
-  }
+  // ---- Holding a tracked tag: bias HEAVILY toward "still present" ----
+  // A tag physically on the reader must NEVER falsely report "removed", even after months. Removal is
+  // accepted ONLY when a HEALTHY reader confirms a genuinely empty field, continuously, for
+  // REMOVE_CONFIRM_MS. A wedged/down reader can't judge presence, so it holds the tag and lets
+  // serviceReader recover it. A weakly-coupled tag that only answers a bare field ping still counts as
+  // present. A different UID appearing is handled as a swap (removed old + present new).
   if (currentUID != "") {
-    if (isTagStillPresent()) {
-      lastSeenAt = millis();
-    } else if (millis() - lastSeenAt > REMOVE_TIMEOUT) {
-      Serial.println("Tag removed: " + currentUID);
+    if (!rc522Ok) { emptySince = 0; return; }          // reader down -> hold, recover in background
+
+    // Full read first: confirms the exact UID and catches a swap to a different tag.
+    String seen = "";
+    for (int a = 0; a < 5 && seen == ""; a++) seen = tryReadOnce();
+    if (seen == currentUID) { lastSeenAt = millis(); emptySince = 0; return; }   // same tag, present
+    if (seen != "") {                                   // a DIFFERENT tag was placed -> swap
+      Serial.println("Tag swapped: " + currentUID + " -> " + seen);
       postTagEvent(currentUID, "removed");
-      currentUID = "";
-      mfrc522.PCD_Init();
+      currentUID = seen; lastSeenAt = millis(); emptySince = 0;
+      postTagEvent(currentUID, "present");
+      return;
+    }
+    // Full read empty. A weakly-coupled tag (small round bin tag) may still answer a bare field ping
+    // even when it can't complete a select - that counts as PRESENT, so it never goes stale.
+    if (tagAnswersField()) { lastSeenAt = millis(); emptySince = 0; return; }
+
+    // Genuinely no answer this pass. Start/continue the empty-field window.
+    if (emptySince == 0) emptySince = millis();
+    // Part-way through, hard-RST the reader once to un-stick a jammed RF front-end (answers on SPI but
+    // has stopped reading) before we let the window run toward removal.
+    if (millis() - emptySince > REPROBE_AFTER_MS && millis() - lastReprobeAt > REPROBE_AFTER_MS) {
+      lastReprobeAt = millis();
+      startRC522();
+      if (rc522Ok) {
+        String again = "";
+        for (int a = 0; a < 5 && again == ""; a++) again = tryReadOnce();
+        if (again == currentUID || (again == "" && tagAnswersField())) { lastSeenAt = millis(); emptySince = 0; return; }
+        if (again != "" && again != currentUID) {
+          Serial.println("Tag swapped (post-reprobe): " + currentUID + " -> " + again);
+          postTagEvent(currentUID, "removed");
+          currentUID = again; lastSeenAt = millis(); emptySince = 0;
+          postTagEvent(currentUID, "present");
+          return;
+        }
+      }
+    }
+    if (millis() - emptySince > REMOVE_CONFIRM_MS) {
+      Serial.println("Tag removed (field empty " + String(REMOVE_CONFIRM_MS / 1000) + "s): " + currentUID);
+      postTagEvent(currentUID, "removed");
+      currentUID = ""; emptySince = 0;
     }
     return;
   }
+
+  if (!rc522Ok) return;                                 // no tag tracked and reader down -> nothing to do
   // Detect a tag with WakeupA (WUPA, 0x52) - NOT PICC_IsNewCardPresent/REQA (0x26).
   // REQA only answers a tag that has JUST entered the field (IDLE state). A tag already
   // sitting on the reader, or one the reader previously halted, ignores REQA -> you would
