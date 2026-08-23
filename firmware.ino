@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.69"
+#define FW_VERSION "1.0.70"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -771,10 +771,19 @@ void pollRfid() {
   if (currentUID != "") {
     if (!rc522Ok) { emptySince = 0; return; }          // reader down -> hold, recover in background
 
-    // Read the tag: confirms the exact UID and catches a swap to a different tag.
+    // Read the tag at FULL power: confirms the exact UID and catches a swap to a different tag.
     String seen = readTagUid();
     if (seen == currentUID) { lastSeenAt = millis(); emptySince = 0; reprobeCount = 0; return; }  // present
     if (seen != "") { adoptTag(seen); reprobeCount = 0; return; }                 // a different tag -> swap
+    // LOW-POWER dip: a STRONG reader OVER-couples a CLOSE tag at full power and can't read it - it needs
+    // a weaker field. This is the probe-style sweep applied to the PRESENCE check (not just detection),
+    // so an over-coupling close tag is confirmed and HELD instead of going stale. This is the piece the
+    // tag-hold rewrite had dropped.
+    setAntennaDrive(0x44, 0x10, 0x10);
+    String low = readTagUid();
+    setAntennaDrive(0xFF, 0x3F, 0x3F);
+    if (low == currentUID) { lastSeenAt = millis(); emptySince = 0; reprobeCount = 0; return; }  // present (close)
+    if (low != "") { adoptTag(low); reprobeCount = 0; return; }                   // a different close tag -> swap
     // A weakly-coupled tag may still answer a bare field ping even when it can't complete a select.
     if (tagAnswersField()) { lastSeenAt = millis(); emptySince = 0; reprobeCount = 0; return; }
 
