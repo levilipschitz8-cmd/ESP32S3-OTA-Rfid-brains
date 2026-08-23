@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.67"
+#define FW_VERSION "1.0.68"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -83,7 +83,9 @@ unsigned long lastStatusAt = 0;         // last time we printed the human status
 unsigned long lastCloseProbeAt = 0;     // last low-power "close tag" probe while searching
 unsigned long lastGoodContactAt = 0;   // last successful (200) heartbeat
 unsigned long emptySince = 0;          // when a HEALTHY reader first saw an empty field (0 = not empty)
-unsigned long lastReprobeAt = 0;       // last hard RST re-probe while holding a tracked tag
+unsigned long lastReprobeAt = 0;       // last recovery attempt while holding a tracked tag
+unsigned long lastRefreshAt = 0;       // last proactive field-refresh blink while a tag is present
+int           reprobeCount = 0;        // escalating recovery step count for the held tag
 unsigned long lastLevelSnapAt = 0;      // last raw pin-level snapshot POST (machine 7 diagnostic)
 unsigned long lastRawPrintAt = 0;       // last 1 Hz RAW serial print (machine 7 diagnostic)
 
@@ -95,6 +97,9 @@ const unsigned long OTA_CHECK_INTERVAL   = 60000;    // 60s
 const unsigned long READER_CHECK_INTERVAL = 3000;    // hot-plug re-check
 const unsigned long STATUS_INTERVAL      = 2000;     // print a clear per-board status line this often
 const unsigned long CLOSE_PROBE_INTERVAL = 1000;     // how often (max) to dip to low power for a close tag
+const unsigned long FIELD_REFRESH_INTERVAL = 20000;  // while a tag is present, proactively blink the field
+                                                     // this often so it never sits in a continuous field
+                                                     // long enough to go unresponsive (prevents sticking).
 const unsigned long OFFLINE_REBOOT_TIMEOUT = 60000;  // no server contact for 60s -> self-reboot
 const unsigned long REMOVE_CONFIRM_MS    = 20000;    // A HEALTHY reader must see a genuinely EMPTY field
                                                      // this long, CONTINUOUSLY, before a tracked tag is
@@ -430,6 +435,21 @@ void handleCommand(const String& resp) {
     String detail, readBack;
     bool ok = writeNdefTag(url, text, detail, readBack);
     postCommandResultNdef(cmdId, ok ? "ok" : "fail", detail, readBack);
+  } else if (cmd == "recover_reader") {
+    // Backend-triggered recovery: the dashboard can send this when a board looks stale. Force the full
+    // escalation (longer field blink + reader re-init) and re-scan, so a stuck reader/tag is revived
+    // on demand without anyone touching the hardware. Reports what it found.
+    Serial.println("[cmd] recover_reader id=" + cmdId);
+    cycleAntenna(250);
+    startRC522();
+    reprobeCount = 0; emptySince = 0;
+    String found = readTagUid();
+    String detail = rc522Ok ? ("reader re-inited (v0x" + String(lastReaderVersion, HEX) + ")")
+                            : "reader still not detected";
+    if (found != "" && found != currentUID) { adoptTag(found); }
+    else if (found != "") { lastSeenAt = millis(); }
+    postCommandResult(cmdId, rc522Ok ? "ok" : "fail",
+                      detail + (found != "" ? (", tag=" + found) : ", no tag"));
   } else {
     postCommandResult(cmdId, "fail", "unknown command");
   }
@@ -716,9 +736,9 @@ bool isTagStillPresent() {
 // physically lifting the tag off the reader and putting it back. It fixes a tag that has gone
 // unresponsive after sitting in a continuous field (won't answer WUPA until the field is cycled). The
 // antenna drive registers are untouched, so the field returns at full strength. No RST pin needed.
-void cycleAntenna() {
+void cycleAntenna(unsigned long offMs) {
   mfrc522.PCD_AntennaOff();
-  delay(50);
+  delay(offMs);
   mfrc522.PCD_AntennaOn();
   delay(8);
 }
@@ -748,25 +768,33 @@ void pollRfid() {
   if (currentUID != "") {
     if (!rc522Ok) { emptySince = 0; return; }          // reader down -> hold, recover in background
 
+    // PROACTIVE field refresh: a tag that sits in a continuous field eventually stops answering. Blink
+    // the field periodically (then re-read below) so it never sits long enough to stick. Prevention.
+    if (millis() - lastRefreshAt > FIELD_REFRESH_INTERVAL) {
+      lastRefreshAt = millis();
+      cycleAntenna(50);
+    }
+
     // Read the tag: confirms the exact UID and catches a swap to a different tag.
     String seen = readTagUid();
-    if (seen == currentUID) { lastSeenAt = millis(); emptySince = 0; return; }   // same tag, present
-    if (seen != "") { adoptTag(seen); return; }                                  // a different tag -> swap
+    if (seen == currentUID) { lastSeenAt = millis(); emptySince = 0; reprobeCount = 0; return; }  // present
+    if (seen != "") { adoptTag(seen); reprobeCount = 0; return; }                 // a different tag -> swap
     // A weakly-coupled tag may still answer a bare field ping even when it can't complete a select.
-    if (tagAnswersField()) { lastSeenAt = millis(); emptySince = 0; return; }
+    if (tagAnswersField()) { lastSeenAt = millis(); emptySince = 0; reprobeCount = 0; return; }
 
-    // No answer this pass. Before letting the removal window run, SOFTWARE RE-SEAT the tag: a tag that
-    // has sat in a continuous field can stop answering until the field is blinked (this is why lifting
-    // it off and back on "fixes" it). Cycle the antenna and re-read; if that doesn't do it, a heavier
-    // full reader re-init. Throttled so it isn't hammered every poll.
+    // No answer this pass. Before letting the removal window run, ESCALATE recovery: short antenna
+    // blink -> longer blink -> full reader re-init. A sitting tag that has gone unresponsive answers
+    // again after the field is dropped for long enough (this is why lifting it off and back on works).
     if (emptySince == 0) emptySince = millis();
     if (millis() - lastReprobeAt > REPROBE_AFTER_MS) {
       lastReprobeAt = millis();
-      cycleAntenna();                                   // field OFF/ON = re-seat the sitting tag
+      reprobeCount++;
+      if      (reprobeCount <= 2) cycleAntenna(60);     // quick blink
+      else if (reprobeCount <= 5) cycleAntenna(250);    // longer field-off -> fully drains a stubborn tag
+      else { startRC522(); reprobeCount = 0; }          // heaviest: full reader re-init, then start over
       String again = readTagUid();
-      if (again == "" && !tagAnswersField()) { startRC522(); again = readTagUid(); }  // heavier recovery
-      if (again == currentUID || (again == "" && tagAnswersField())) { lastSeenAt = millis(); emptySince = 0; return; }
-      if (again != "") { adoptTag(again); return; }
+      if (again == currentUID || (again == "" && tagAnswersField())) { lastSeenAt = millis(); emptySince = 0; reprobeCount = 0; return; }
+      if (again != "") { adoptTag(again); reprobeCount = 0; return; }
     }
     if (millis() - emptySince > REMOVE_CONFIRM_MS) {
       Serial.println("Tag removed (field empty " + String(REMOVE_CONFIRM_MS / 1000) + "s): " + currentUID);
@@ -797,7 +825,7 @@ void pollRfid() {
     setAntennaDrive(0xFF, 0x3F, 0x3F);
     // Still nothing: a tag may be sitting there but gone unresponsive. Blink the field to re-seat it,
     // then re-read - this re-finds a tag that had wrongly gone "removed" without anyone touching it.
-    if (uid == "") { cycleAntenna(); uid = readTagUid(); }
+    if (uid == "") { cycleAntenna(120); uid = readTagUid(); }
   }
   if (uid != "") {
     currentUID = uid;
