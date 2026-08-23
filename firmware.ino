@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.66"
+#define FW_VERSION "1.0.67"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -104,9 +104,11 @@ const unsigned long REMOVE_CONFIRM_MS    = 20000;    // A HEALTHY reader must se
                                                      // wedged/down reader never counts toward removal - it
                                                      // holds the tag and recovers. Real removal still
                                                      // clears within ~20s of the field actually going empty.
-const unsigned long REPROBE_AFTER_MS     = 5000;     // after this long with no answer, hard RST re-probe the
-                                                     // reader (un-sticks a jammed RF front-end) before the
-                                                     // empty window is allowed to run toward removal.
+const unsigned long REPROBE_AFTER_MS     = 2000;     // when a tracked tag stops answering, cycle the antenna
+                                                     // (drop+re-apply the field = "software re-seat" the tag)
+                                                     // at most this often, before the empty window can run
+                                                     // toward removal. A sitting tag that has gone
+                                                     // unresponsive answers again after the field blinks.
 
 void resolveIdentity() {
   prefs.begin("ident", false);
@@ -709,6 +711,33 @@ bool isTagStillPresent() {
   return tagAnswersField();
 }
 
+// "Software re-seat": drop the RF field for a moment then bring it back. A passive tag is powered by
+// the field, so this forces it to lose power and reset to its power-on (IDLE) state - exactly like
+// physically lifting the tag off the reader and putting it back. It fixes a tag that has gone
+// unresponsive after sitting in a continuous field (won't answer WUPA until the field is cycled). The
+// antenna drive registers are untouched, so the field returns at full strength. No RST pin needed.
+void cycleAntenna() {
+  mfrc522.PCD_AntennaOff();
+  delay(50);
+  mfrc522.PCD_AntennaOn();
+  delay(8);
+}
+
+// Switch the tracked tag to a newly-seen UID (a swap): report the old one removed and the new present.
+void adoptTag(const String& newUid) {
+  Serial.println("Tag swapped: " + currentUID + " -> " + newUid);
+  postTagEvent(currentUID, "removed");
+  currentUID = newUid; lastSeenAt = millis(); emptySince = 0;
+  postTagEvent(currentUID, "present");
+}
+
+// Read the tag UID with a few tries; "" if nothing answered.
+String readTagUid() {
+  String u = "";
+  for (int a = 0; a < 5 && u == ""; a++) u = tryReadOnce();
+  return u;
+}
+
 void pollRfid() {
   // ---- Holding a tracked tag: bias HEAVILY toward "still present" ----
   // A tag physically on the reader must NEVER falsely report "removed", even after months. Removal is
@@ -719,40 +748,25 @@ void pollRfid() {
   if (currentUID != "") {
     if (!rc522Ok) { emptySince = 0; return; }          // reader down -> hold, recover in background
 
-    // Full read first: confirms the exact UID and catches a swap to a different tag.
-    String seen = "";
-    for (int a = 0; a < 5 && seen == ""; a++) seen = tryReadOnce();
+    // Read the tag: confirms the exact UID and catches a swap to a different tag.
+    String seen = readTagUid();
     if (seen == currentUID) { lastSeenAt = millis(); emptySince = 0; return; }   // same tag, present
-    if (seen != "") {                                   // a DIFFERENT tag was placed -> swap
-      Serial.println("Tag swapped: " + currentUID + " -> " + seen);
-      postTagEvent(currentUID, "removed");
-      currentUID = seen; lastSeenAt = millis(); emptySince = 0;
-      postTagEvent(currentUID, "present");
-      return;
-    }
-    // Full read empty. A weakly-coupled tag (small round bin tag) may still answer a bare field ping
-    // even when it can't complete a select - that counts as PRESENT, so it never goes stale.
+    if (seen != "") { adoptTag(seen); return; }                                  // a different tag -> swap
+    // A weakly-coupled tag may still answer a bare field ping even when it can't complete a select.
     if (tagAnswersField()) { lastSeenAt = millis(); emptySince = 0; return; }
 
-    // Genuinely no answer this pass. Start/continue the empty-field window.
+    // No answer this pass. Before letting the removal window run, SOFTWARE RE-SEAT the tag: a tag that
+    // has sat in a continuous field can stop answering until the field is blinked (this is why lifting
+    // it off and back on "fixes" it). Cycle the antenna and re-read; if that doesn't do it, a heavier
+    // full reader re-init. Throttled so it isn't hammered every poll.
     if (emptySince == 0) emptySince = millis();
-    // Part-way through, hard-RST the reader once to un-stick a jammed RF front-end (answers on SPI but
-    // has stopped reading) before we let the window run toward removal.
-    if (millis() - emptySince > REPROBE_AFTER_MS && millis() - lastReprobeAt > REPROBE_AFTER_MS) {
+    if (millis() - lastReprobeAt > REPROBE_AFTER_MS) {
       lastReprobeAt = millis();
-      startRC522();
-      if (rc522Ok) {
-        String again = "";
-        for (int a = 0; a < 5 && again == ""; a++) again = tryReadOnce();
-        if (again == currentUID || (again == "" && tagAnswersField())) { lastSeenAt = millis(); emptySince = 0; return; }
-        if (again != "" && again != currentUID) {
-          Serial.println("Tag swapped (post-reprobe): " + currentUID + " -> " + again);
-          postTagEvent(currentUID, "removed");
-          currentUID = again; lastSeenAt = millis(); emptySince = 0;
-          postTagEvent(currentUID, "present");
-          return;
-        }
-      }
+      cycleAntenna();                                   // field OFF/ON = re-seat the sitting tag
+      String again = readTagUid();
+      if (again == "" && !tagAnswersField()) { startRC522(); again = readTagUid(); }  // heavier recovery
+      if (again == currentUID || (again == "" && tagAnswersField())) { lastSeenAt = millis(); emptySince = 0; return; }
+      if (again != "") { adoptTag(again); return; }
     }
     if (millis() - emptySince > REMOVE_CONFIRM_MS) {
       Serial.println("Tag removed (field empty " + String(REMOVE_CONFIRM_MS / 1000) + "s): " + currentUID);
@@ -781,6 +795,9 @@ void pollRfid() {
     setAntennaDrive(0x44, 0x10, 0x10);
     for (int attempt = 0; attempt < 2 && uid == ""; attempt++) uid = tryReadOnce();
     setAntennaDrive(0xFF, 0x3F, 0x3F);
+    // Still nothing: a tag may be sitting there but gone unresponsive. Blink the field to re-seat it,
+    // then re-read - this re-finds a tag that had wrongly gone "removed" without anyone touching it.
+    if (uid == "") { cycleAntenna(); uid = readTagUid(); }
   }
   if (uid != "") {
     currentUID = uid;
