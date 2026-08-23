@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.68"
+#define FW_VERSION "1.0.69"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -467,6 +467,9 @@ void sendHeartbeat() {
                 "\",\"ip\":\"" + ip +
                 "\",\"rssi\":" + String(rssi) +
                 ",\"board_code\":\"" + boardCode + "\"" +
+                ",\"reader_ok\":" + (rc522Ok ? "true" : "false") +           // reader detected & configured
+                ",\"reader_ver\":\"0x" + String(lastReaderVersion, HEX) + "\"" +  // RC522 version byte
+                ",\"tag\":\"" + currentUID + "\"" +                          // UID currently held ("" = none)
                 ",\"boot\":" + (firstBeat ? "true" : "false") + "}";
   String resp;
   int code = postJson(HEARTBEAT_URL, body, resp);
@@ -767,13 +770,6 @@ void pollRfid() {
   // present. A different UID appearing is handled as a swap (removed old + present new).
   if (currentUID != "") {
     if (!rc522Ok) { emptySince = 0; return; }          // reader down -> hold, recover in background
-
-    // PROACTIVE field refresh: a tag that sits in a continuous field eventually stops answering. Blink
-    // the field periodically (then re-read below) so it never sits long enough to stick. Prevention.
-    if (millis() - lastRefreshAt > FIELD_REFRESH_INTERVAL) {
-      lastRefreshAt = millis();
-      cycleAntenna(50);
-    }
 
     // Read the tag: confirms the exact UID and catches a swap to a different tag.
     String seen = readTagUid();
