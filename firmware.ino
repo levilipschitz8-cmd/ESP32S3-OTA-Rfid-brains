@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.72"
+#define FW_VERSION "1.0.73"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -115,6 +115,15 @@ const unsigned long REMOVE_CONFIRM_MS    = 20000;    // A HEALTHY reader must se
                                                      // wedged/down reader never counts toward removal - it
                                                      // holds the tag and recovers. Real removal still
                                                      // clears within ~20s of the field actually going empty.
+const unsigned long REBOOT_RECOVER_MS    = 45000;    // A held tag that stops answering for this long, AFTER
+                                                     // antenna re-seat + full reader re-init have both been
+                                                     // tried and failed, is a WEDGED reader (not a real
+                                                     // removal - a held tag is treated as permanent here).
+                                                     // Reboot to recover: the same clean reset an OTA update
+                                                     // does, the one thing observed to bring a dead reader
+                                                     // back. Fires at most once per episode (after reboot
+                                                     // currentUID is empty, so the detect loop re-finds the
+                                                     // tag - no reboot-loop, and no false "removed").
 const unsigned long REPROBE_AFTER_MS     = 2000;     // when a tracked tag stops answering, cycle the antenna
                                                      // (drop+re-apply the field = "software re-seat" the tag)
                                                      // at most this often, before the empty window can run
@@ -828,10 +837,18 @@ void pollRfid() {
       if (again == currentUID || (again == "" && tagAnswersField())) { lastSeenAt = millis(); emptySince = 0; reprobeCount = 0; return; }
       if (again != "") { adoptTag(again); reprobeCount = 0; return; }
     }
-    if (millis() - emptySince > REMOVE_CONFIRM_MS) {
-      Serial.println("Tag removed (field empty " + String(REMOVE_CONFIRM_MS / 1000) + "s): " + currentUID);
-      postTagEvent(currentUID, "removed");
-      currentUID = ""; emptySince = 0;
+    // Terminal escalation. We do NOT post "removed" from an empty field - on these readers a held tag is
+    // permanent, so a silent no-read is a WEDGED reader, and a false "removed"/stale is exactly what must
+    // never appear. A real change of tag is still caught above (adoptTag on a different UID = swap). If the
+    // held tag has not answered for REBOOT_RECOVER_MS despite every lighter recovery, reboot to recover the
+    // reader - the same clean reset an OTA update does. Fires at most once per episode: after the reboot
+    // currentUID is empty, so the detect loop (not this path) re-finds a tag that is really still there, and
+    // a genuinely-removed tag is simply not re-found - it never produces a false "removed".
+    if (millis() - emptySince > REBOOT_RECOVER_MS) {
+      Serial.println("[wedge] held tag unconfirmed " + String(REBOOT_RECOVER_MS / 1000) +
+                     "s after antenna re-seat + reader re-init - rebooting to recover: " + currentUID);
+      delay(50);
+      ESP.restart();
     }
     return;
   }
