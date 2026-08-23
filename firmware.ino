@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.71"
+#define FW_VERSION "1.0.72"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -456,6 +456,21 @@ void handleCommand(const String& resp) {
     else if (found != "") { lastSeenAt = millis(); }
     postCommandResult(cmdId, rc522Ok ? "ok" : "fail",
                       detail + (found != "" ? (", tag=" + found) : ", no tag"));
+  } else if (cmd == "clear_tag") {
+    // Backend is the authority on removal: it says the tag is genuinely gone, so clear it. Together
+    // with recover_reader this splits the ambiguity the board can't resolve alone - the server decides
+    // "really removed" (clear_tag) vs "stuck, heal yourself" (recover_reader). Optionally scoped to a
+    // uid so a stale command can't clear a tag that has since changed.
+    String want = jsonStr(resp, "uid");                 // optional: only clear if it matches
+    Serial.println("[cmd] clear_tag id=" + cmdId + " uid=" + want + " (holding " + currentUID + ")");
+    if (currentUID == "") { postCommandResult(cmdId, "ok", "no tag to clear"); }
+    else if (want != "" && want != currentUID) { postCommandResult(cmdId, "ok", "held " + currentUID + " != " + want + ", not cleared"); }
+    else {
+      String had = currentUID;
+      postTagEvent(currentUID, "removed");
+      currentUID = ""; emptySince = 0;
+      postCommandResult(cmdId, "ok", "cleared " + had);
+    }
   } else {
     postCommandResult(cmdId, "fail", "unknown command");
   }
@@ -469,6 +484,10 @@ void sendHeartbeat() {
   if (WiFi.status() != WL_CONNECTED) return;
   String ip = WiFi.localIP().toString();
   long rssi = WiFi.RSSI();
+  // Seconds until this board's next OTA-version check (checkOTA runs every OTA_CHECK_INTERVAL). Lets
+  // the dashboard show, per board, how long until it will pick up a new firmware/target you push.
+  long otaMs = (long)OTA_CHECK_INTERVAL - (long)(millis() - lastOtaAt);
+  long otaInS = otaMs > 0 ? otaMs / 1000 : 0;
   String body = String("{\"firmware_version\":\"") + FW_VERSION +
                 "\",\"ip\":\"" + ip +
                 "\",\"rssi\":" + String(rssi) +
@@ -476,6 +495,8 @@ void sendHeartbeat() {
                 ",\"reader_ok\":" + (rc522Ok ? "true" : "false") +           // reader detected & configured
                 ",\"reader_ver\":\"0x" + String(lastReaderVersion, HEX) + "\"" +  // RC522 version byte
                 ",\"tag\":\"" + currentUID + "\"" +                          // UID currently held ("" = none)
+                ",\"ota_in_s\":" + String(otaInS) +                          // seconds to next OTA check
+                ",\"ota_interval_s\":" + String(OTA_CHECK_INTERVAL / 1000) + // OTA check period
                 ",\"boot\":" + (firstBeat ? "true" : "false") + "}";
   String resp;
   int code = postJson(HEARTBEAT_URL, body, resp);
