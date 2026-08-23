@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.76"
+#define FW_VERSION "1.0.77"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -46,6 +46,7 @@ bool rc522Ok = false;
 bool firstBeat = true;
 bool wifiUp = false;
 bool everConnected = false;             // reached the server at least once this boot
+bool everSawTag = false;                // read a tag at least once THIS boot (gates the reader-stuck reboot)
 // ---- Injection-machine signal monitoring (machine 7 ONLY; dormant on every other board) ----
 // Seven PC817-isolated signals from the moulding machine. Confirmed ACTIVE-LOW (GPIO 6 proved it:
 // pulled LOW when the mould opened, released HIGH). So: INPUT_PULLUP on every channel, and a pin is
@@ -107,6 +108,13 @@ const unsigned long FIELD_REFRESH_INTERVAL = 20000;  // while a tag is present, 
                                                      // this often so it never sits in a continuous field
                                                      // long enough to go unresponsive (prevents sticking).
 const unsigned long OFFLINE_REBOOT_TIMEOUT = 60000;  // no server contact for 60s -> self-reboot
+const unsigned long READER_STUCK_REBOOT_MS = 45000;  // held a tag, then reader reads NOTHING (no UID, not
+                                                     // even a bare field answer) for this long -> the reader
+                                                     // has wedged in the way only a reboot clears (same as
+                                                     // "it works again after a software update"). Self-reboot
+                                                     // to recover. Gated on everSawTag so a spare/empty reader
+                                                     // never loops, and self-limiting (everSawTag clears on
+                                                     // reboot) so a genuinely-removed tag reboots at most once.
 const unsigned long REMOVE_CONFIRM_MS    = 20000;    // A HEALTHY reader must see a genuinely EMPTY field
                                                      // this long, CONTINUOUSLY, before a tracked tag is
                                                      // declared removed. A tag physically on the reader
@@ -468,7 +476,7 @@ void handleCommand(const String& resp) {
     else {
       String had = currentUID;
       postTagEvent(currentUID, "removed");
-      currentUID = ""; emptySince = 0;
+      currentUID = ""; emptySince = 0; everSawTag = false;   // human says bin is gone -> don't reboot-recover
       postCommandResult(cmdId, "ok", "cleared " + had);
     }
   } else {
@@ -777,7 +785,7 @@ void cycleAntenna(unsigned long offMs) {
 void adoptTag(const String& newUid) {
   Serial.println("Tag swapped: " + currentUID + " -> " + newUid);
   postTagEvent(currentUID, "removed");
-  currentUID = newUid; lastSeenAt = millis(); emptySince = 0;
+  currentUID = newUid; lastSeenAt = millis(); emptySince = 0; everSawTag = true;
   postTagEvent(currentUID, "present");
 }
 
@@ -870,6 +878,7 @@ void pollRfid() {
   if (uid != "") {
     currentUID = uid;
     lastSeenAt = millis();
+    everSawTag = true;
     Serial.println("Tag present: " + currentUID);
     postTagEvent(currentUID, "present");
   }
@@ -956,6 +965,18 @@ void loop() {
   // If we never connected (no network here), don't reboot-loop - just keep trying.
   if (everConnected && now - lastGoodContactAt > OFFLINE_REBOOT_TIMEOUT) {
     Serial.println("[watchdog] lost server contact for 60s - rebooting to recover");
+    delay(50);
+    ESP.restart();
+  }
+
+  // Reader-stuck watchdog: if this board HAS read a tag this boot but the reader has now read nothing at
+  // all for READER_STUCK_REBOOT_MS (no UID, not even a bare field answer -> lastSeenAt stops advancing),
+  // the reader has wedged in the way that only a reboot clears - the same recovery you see when "it works
+  // again after a software update". Reboot to do that automatically. everSawTag gates it (a spare/empty
+  // reader never triggers it) and clears on reboot, so a genuinely-removed tag causes at most ONE reboot.
+  if (everSawTag && now - lastSeenAt > READER_STUCK_REBOOT_MS) {
+    Serial.println("[watchdog] reader read nothing for " + String(READER_STUCK_REBOOT_MS / 1000) +
+                   "s after holding a tag - rebooting to recover the reader");
     delay(50);
     ESP.restart();
   }
