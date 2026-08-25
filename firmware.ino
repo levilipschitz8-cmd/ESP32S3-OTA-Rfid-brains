@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.95"
+#define FW_VERSION "1.0.96"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -513,8 +513,8 @@ bool writeNdefTag(const String& url, const String& text, String& detail, String&
   if (!rc522Ok) { detail = "reader not detected"; return false; }
   // Acquire via the LEVEL SWEEP (not full power only) so an over-coupled close tag is found and the level
   // is tuned in one step - this is what "no tag on reader (2s scan)" was missing.
-  int wlvl = selectTagSweep(2000);
-  if (wlvl < 0) { detail = "no tag on reader (2s sweep)"; return false; }
+  int wlvl = selectTagSweep(5000);                       // 5s (was 2s): wait out a tag that flickers off the
+  if (wlvl < 0) { detail = "no tag on reader (5s sweep)"; return false; }   // coil, grab it the instant it's back
   String ttype = tagTypeName(mfrc522.uid.sak);
   if (mfrc522.uid.sak != 0x00) {                        // Classic goes through write_tag, not here
     detail = "not an NTAG (type=" + ttype + ", sak=0x" + String(mfrc522.uid.sak, HEX) + ")";
@@ -641,7 +641,7 @@ void postCommandResultRead(const String& cmdId, const String& status, const Stri
 void readNdefTag(const String& cmdId) {
   if (!rc522Ok) { postCommandResultRead(cmdId, "fail", "", "unknown", "", "reader not detected"); return; }
   // Sweep RF levels to acquire (an over-coupled close tag won't select at full power), then restore full.
-  if (selectTagSweep(2000) < 0) { postCommandResult(cmdId, "fail", "no tag on reader (2s sweep)"); return; }
+  if (selectTagSweep(4000) < 0) { postCommandResult(cmdId, "fail", "no tag on reader (4s sweep)"); return; }
   String uid = uidToString(mfrc522.uid);
   byte sak = mfrc522.uid.sak;
   String tagType, textOut = "", uriOut = "";
