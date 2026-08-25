@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.96"
+#define FW_VERSION "1.0.97"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -462,8 +462,10 @@ const RfLevel RF_LEVELS[] = {
   { 0xFF, 0x3F, 0x3F, 0x07 << 4 },   // full  TX + 48dB - distance tag
   { 0x88, 0x20, 0x20, 0x06 << 4 },   //             43dB
   { 0x44, 0x10, 0x10, 0x04 << 4 },   // low   TX + 33dB - close
-  { 0x22, 0x08, 0x08, 0x01 << 4 },   // v.low TX + 23dB - very close
-  { 0x11, 0x04, 0x04, 0x00 << 4 },   // min   TX + 18dB - severe over-couple
+  { 0x22, 0x08, 0x08, 0x01 << 4 },   // v.low  TX + 23dB - very close
+  { 0x11, 0x04, 0x04, 0x00 << 4 },   // min    TX + 18dB - severe over-couple
+  { 0x08, 0x02, 0x02, 0x00 << 4 },   // ultra  TX + 18dB - a STRONG reader over-coupling at fixed distance
+  { 0x04, 0x01, 0x01, 0x00 << 4 },   // floor  TX + 18dB - strongest reader / tag almost on the coil
 };
 const int RF_NLEVELS = sizeof(RF_LEVELS) / sizeof(RF_LEVELS[0]);
 void setRfLevel(int i) {
