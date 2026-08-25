@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.92"
+#define FW_VERSION "1.0.93"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -489,6 +489,19 @@ bool reselectAtLevel(int level) {
   return selectTagWithin(300);
 }
 
+// READY-TO-WRITE: get the coupling as steady as possible before the first page burn. Re-grab the tag a few
+// times at the tuned level with short warm-ups so its capacitor is fully charged and the field is settled
+// when the write hits - the write draws a current pulse a half-charged / unsteady tag can't deliver, which
+// is why a marginal board fails at page 4 though the select succeeded. Leaves the tag selected.
+void stabilizeForWrite(int level) {
+  int good = 0;
+  for (int i = 0; i < 8 && good < 3; i++) {              // up to 8 tries to see 3 clean selects in a row
+    if (reselectAtLevel(level)) { good++; delay(25); }   // charge between confirms
+    else { good = 0; delay(15); }
+  }
+  delay(40);                                             // final top-up charge before the first write
+}
+
 bool writeNdefTag(const String& url, const String& text, String& detail, String& readBack) {
   if (!rc522Ok) { detail = "reader not detected"; return false; }
   if (!selectTagWithin(2000)) { detail = "no tag on reader (2s scan)"; return false; }
@@ -503,6 +516,11 @@ bool writeNdefTag(const String& url, const String& text, String& detail, String&
   // tag selects cleanly and the tag selected; we write there, then restore full on every exit below.
   int wlvl = tuneWriteLevel();
   if (wlvl < 0) wlvl = 0;
+  // Quiet the WiFi radio for the duration of the write. WiFi TX bursts share the board's 3.3V with the
+  // reader; silencing them frees supply headroom for the reader's current spike during the EEPROM burn -
+  // the software stand-in for a decoupling cap. Restored on EVERY exit below (paired with setRfFull).
+  WiFi.setSleep(true);
+  stabilizeForWrite(wlvl);                               // charge the tag + settle the field before writing
   // Capability Container (page 3): a phone/tablet reads THIS FIRST to decide the tag is an NDEF tag at
   // all. If it isn't E1 10 xx 00, the tag is invisible to phones even though the NDEF is written - our own
   // read-back still decodes it, which is why "verified" tags wouldn't read on your tablet. A factory NTAG
@@ -519,7 +537,7 @@ bool writeNdefTag(const String& url, const String& text, String& detail, String&
       }
       if (!ccWrote) {
         detail = "capability container (page 3) write failed - tag locked? (type=" + ttype + ")";
-        mfrc522.PICC_HaltA(); setRfFull(); return false;
+        mfrc522.PICC_HaltA(); setRfFull(); WiFi.setSleep(false); return false;
       }
       delay(5);
     }
@@ -543,7 +561,7 @@ bool writeNdefTag(const String& url, const String& text, String& detail, String&
     // though it's not locked. On failure re-grab the tag and retry this page before giving up, so a
     // marginal seat still completes instead of aborting the whole write.
     bool wrote = false;
-    for (int attempt = 0; attempt < 6 && !wrote; attempt++) {   // 6 tries (was 4) for a marginal seat
+    for (int attempt = 0; attempt < 8 && !wrote; attempt++) {   // 8 tries for a marginal seat
       if (mfrc522.MIFARE_Ultralight_Write((byte)(4 + pg), page, 4) == MFRC522::STATUS_OK) { wrote = true; break; }
       delay(10);
       reselectAtLevel(wlvl);                             // re-grab at the tuned level (don't snap back to full)
@@ -569,7 +587,7 @@ bool writeNdefTag(const String& url, const String& text, String& detail, String&
         detail = "page 4 write failed but lock bytes CLEAR (" + hex + ") - NOT locked; weak reader/coupling on this board or password - reposition tag / check reader (type=" + ttype + ")";
       else
         detail = "ntag write failed at page " + String(4 + pg) + " - tag slipped out of field mid-write, reposition/steady it (type=" + ttype + ")";
-      mfrc522.PICC_HaltA(); setRfFull(); return false;
+      mfrc522.PICC_HaltA(); setRfFull(); WiFi.setSleep(false); return false;
     }
     delay(5);                                            // let the NTAG commit the page before the next write
   }
@@ -585,7 +603,7 @@ bool writeNdefTag(const String& url, const String& text, String& detail, String&
     for (int k = 0; k < 16; k++) back[backLen++] = b[k];
   }
   mfrc522.PICC_HaltA();
-  setRfFull();                                           // restore full drive + max gain for normal polling
+  setRfFull(); WiFi.setSleep(false);                     // restore full drive + max gain + WiFi for normal ops
   readBack = decodeNdefText(back, backLen);
   bool phoneReadable = (ccMagic == 0xE1) && (backLen > 0) && (back[0] == 0x03);
   detail = String(phoneReadable ? "wrote+verified NDEF, phone-readable" : "wrote NDEF but NOT phone-readable")
