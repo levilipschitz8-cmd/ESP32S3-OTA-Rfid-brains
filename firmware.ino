@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.78"
+#define FW_VERSION "1.0.79"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -115,14 +115,16 @@ const unsigned long READER_STUCK_REBOOT_MS = 45000;  // held a tag, then reader 
                                                      // to recover. Gated on everSawTag so a spare/empty reader
                                                      // never loops, and self-limiting (everSawTag clears on
                                                      // reboot) so a genuinely-removed tag reboots at most once.
-const unsigned long REMOVE_CONFIRM_MS    = 20000;    // A HEALTHY reader must see a genuinely EMPTY field
+const unsigned long REMOVE_CONFIRM_MS    = 8000;     // A HEALTHY reader must see a genuinely EMPTY field
                                                      // this long, CONTINUOUSLY, before a tracked tag is
                                                      // declared removed. A tag physically on the reader
                                                      // answers the field ping every poll and resets this,
                                                      // so it stays "present" indefinitely (months). A
                                                      // wedged/down reader never counts toward removal - it
-                                                     // holds the tag and recovers. Real removal still
-                                                     // clears within ~20s of the field actually going empty.
+                                                     // holds the tag and recovers. 8s (was 20s): a real
+                                                     // removal off a healthy reader now reports ~3x quicker;
+                                                     // a wedged reader can flash a brief false "removed" but
+                                                     // self-recovers, and only the wedge-prone boards do that.
 const unsigned long REPROBE_AFTER_MS     = 2000;     // when a tracked tag stops answering, cycle the antenna
                                                      // (drop+re-apply the field = "software re-seat" the tag)
                                                      // at most this often, before the empty window can run
