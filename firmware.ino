@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.97"
+#define FW_VERSION "1.0.98"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -878,20 +878,27 @@ byte readReaderVersion() {
 }
 
 void startRC522() {
-  SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
-  SPI.setFrequency(50000);               // 50 kHz: maximum tolerance for very long (~3 m) cables
   for (byte i = 0; i < 6; i++) mifareKey.keyByte[i] = 0xFF;
-  // Hardware reset pulse on RST before init. A reader that has WEDGED (locked up, reads v0x0)
-  // is un-stuck far more reliably by a real power-on reset than by a soft init - this is what
-  // lets a wedged reader recover on re-init instead of staying dead until a manual replug.
-  pinMode(RST_PIN, OUTPUT);
-  digitalWrite(RST_PIN, LOW);
-  delay(10);
-  digitalWrite(RST_PIN, HIGH);
-  delay(50);
-  mfrc522.PCD_Init();
-  delay(50);
-  byte v = readReaderVersion();
+  // Try progressively SLOWER SPI clocks. A reader that reads GARBAGE (0xEE) or NOTHING (0x0) is usually a
+  // marginal / electrically-noisy SPI link over a long cable - NOT a dead module. A slower clock very often
+  // gets it talking again with zero hardware changes, so we don't give up (or tell you to buy a reader)
+  // until every speed has failed. A healthy reader answers at the first (fastest) speed, so it's unaffected.
+  const uint32_t spiSpeeds[] = { 50000, 25000, 10000, 5000 };
+  byte v = 0;
+  for (int s = 0; s < 4; s++) {
+    SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
+    SPI.setFrequency(spiSpeeds[s]);
+    pinMode(RST_PIN, OUTPUT);               // hardware reset pulse (un-sticks a wedged reader)
+    digitalWrite(RST_PIN, LOW);  delay(10);
+    digitalWrite(RST_PIN, HIGH); delay(50);
+    mfrc522.PCD_Init();
+    delay(50);
+    v = readReaderVersion();
+    if (isValidReaderVersion(v)) {
+      if (s > 0) Serial.println("[rc522] recovered at " + String(spiSpeeds[s]) + " Hz SPI (noisy cable)");
+      break;                                // clean version at this speed -> keep it
+    }
+  }
   lastReaderVersion = v;
   rc522Ok = isValidReaderVersion(v);
   if (rc522Ok) {
