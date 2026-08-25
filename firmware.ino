@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.93"
+#define FW_VERSION "1.0.94"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -469,19 +469,6 @@ void setRfLevel(int i) {
 }
 void setRfFull() { setRfLevel(0); }
 
-// Find the antenna level at which THIS tag SELECTS cleanly and LEAVE it set (tag selected) for the write.
-// A write needs good coupling even more than a read; writing at the level where the tag actually couples
-// (not blindly at full power, which OVER-couples a close tag) is what makes a close tag's write take.
-// Returns the level index, or -1 (restores full) if the tag won't select at any level.
-int tuneWriteLevel() {
-  for (int i = 0; i < RF_NLEVELS; i++) {
-    setRfLevel(i);
-    if (selectTagWithin(200)) return i;
-  }
-  setRfFull();
-  return -1;
-}
-
 // Re-grab a tag mid-write at a SPECIFIC tuned level (used between page-write retries so we stay at the
 // level the tag couples well, instead of snapping back to full and over-coupling a close tag again).
 bool reselectAtLevel(int level) {
@@ -502,20 +489,35 @@ void stabilizeForWrite(int level) {
   delay(40);                                             // final top-up charge before the first write
 }
 
+// Acquire a tag by SWEEPING RF levels (TX + RX gain), not just full power. An OVER-coupled close tag won't
+// select at full power - which is why "no tag on reader (2s scan)" fired even with a tag sitting there.
+// Tries full first (best for a distance tag), then progressively "further away". Leaves the winning level
+// set and the tag selected; returns the level index, or -1 (restores full) if nothing selects within `ms`.
+int selectTagSweep(unsigned long ms) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < ms) {
+    for (int i = 0; i < RF_NLEVELS; i++) {
+      setRfLevel(i);
+      if (selectTagWithin(120)) return i;
+    }
+  }
+  setRfFull();
+  return -1;
+}
+
 bool writeNdefTag(const String& url, const String& text, String& detail, String& readBack) {
   if (!rc522Ok) { detail = "reader not detected"; return false; }
-  if (!selectTagWithin(2000)) { detail = "no tag on reader (2s scan)"; return false; }
+  // Acquire via the LEVEL SWEEP (not full power only) so an over-coupled close tag is found and the level
+  // is tuned in one step - this is what "no tag on reader (2s scan)" was missing.
+  int wlvl = selectTagSweep(2000);
+  if (wlvl < 0) { detail = "no tag on reader (2s sweep)"; return false; }
   String ttype = tagTypeName(mfrc522.uid.sak);
   if (mfrc522.uid.sak != 0x00) {                        // Classic goes through write_tag, not here
     detail = "not an NTAG (type=" + ttype + ", sak=0x" + String(mfrc522.uid.sak, HEX) + ")";
     mfrc522.PICC_HaltA(); return false;
   }
-  // Tune the antenna to THIS tag's best coupling level BEFORE writing. A write needs good coupling even
-  // more than a read; blasting full power OVER-couples a close tag and its write fails at page 4 (the exact
-  // "page 4 failed, lock bytes clear" symptom). tuneWriteLevel leaves the antenna at the level where the
-  // tag selects cleanly and the tag selected; we write there, then restore full on every exit below.
-  int wlvl = tuneWriteLevel();
-  if (wlvl < 0) wlvl = 0;
+  // wlvl (from selectTagSweep above) is already the tag's best coupling level - we write there. Full power
+  // OVER-couples a close tag and its write fails at page 4; writing at the tuned level is the fix.
   // Quiet the WiFi radio for the duration of the write. WiFi TX bursts share the board's 3.3V with the
   // reader; silencing them frees supply headroom for the reader's current spike during the EEPROM burn -
   // the software stand-in for a decoupling cap. Restored on EVERY exit below (paired with setRfFull).
@@ -634,7 +636,8 @@ void postCommandResultRead(const String& cmdId, const String& status, const Stri
 // READ-ONLY: scan for a tag, decode its NDEF, and report it. Writes NOTHING (no page writes, no lock bytes).
 void readNdefTag(const String& cmdId) {
   if (!rc522Ok) { postCommandResultRead(cmdId, "fail", "", "unknown", "", "reader not detected"); return; }
-  if (!selectTagWithin(2000)) { postCommandResult(cmdId, "fail", "no tag on reader (2s scan)"); return; }
+  // Sweep RF levels to acquire (an over-coupled close tag won't select at full power), then restore full.
+  if (selectTagSweep(2000) < 0) { postCommandResult(cmdId, "fail", "no tag on reader (2s sweep)"); return; }
   String uid = uidToString(mfrc522.uid);
   byte sak = mfrc522.uid.sak;
   String tagType, textOut = "", uriOut = "";
@@ -662,6 +665,7 @@ void readNdefTag(const String& cmdId) {
     decodeNdefRecords(data, n, textOut, uriOut);
   }
   mfrc522.PICC_HaltA(); mfrc522.PCD_StopCrypto1();     // release the tag; normal polling (WUPA) resumes
+  setRfFull();                                         // restore full drive + max gain after the level sweep
   String detail = uriOut.length() ? ("uri=" + uriOut) : ("read " + String(bytesRead) + " bytes");
   postCommandResultRead(cmdId, "ok", uid, tagType, textOut, detail);
 }
