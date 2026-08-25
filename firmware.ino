@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.81"
+#define FW_VERSION "1.0.82"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -78,7 +78,9 @@ unsigned long lastSeenAt = 0;
 unsigned long lastHeartbeatAt = 0;
 unsigned long lastRfidPollAt = 0;
 unsigned long lastWifiCheckAt = 0;
-unsigned long lastOtaAt = 0;
+unsigned long lastOtaAt = 0;            // millis() stamped when the last OTA check RETURNED (0 = none yet)
+bool          otaInProgress = false;    // an OTA download/flash is running right now (heartbeat sends ota_in_s=0)
+String        lastOtaResult = "pending"; // ok|no_update|http_404|flash_fail|http_<code>|wifi_down|pending
 unsigned long lastReaderCheckAt = 0;
 unsigned long lastStatusAt = 0;         // last time we printed the human status line
 unsigned long lastCloseProbeAt = 0;     // last low-power "close tag" probe while searching
@@ -517,10 +519,13 @@ void sendHeartbeat() {
   if (WiFi.status() != WL_CONNECTED) return;
   String ip = WiFi.localIP().toString();
   long rssi = WiFi.RSSI();
-  // Seconds until this board's next OTA-version check (checkOTA runs every OTA_CHECK_INTERVAL). Lets
-  // the dashboard show, per board, how long until it will pick up a new firmware/target you push.
-  long otaMs = (long)OTA_CHECK_INTERVAL - (long)(millis() - lastOtaAt);
-  long otaInS = otaMs > 0 ? otaMs / 1000 : 0;
+  // Accurate OTA schedule. Single source of truth = OTA_CHECK_INTERVAL, the SAME timer that drives the OTA
+  // task; lastOtaAt is stamped when a check actually RETURNS (see loop). ota_in_s counts down to the next
+  // real check, and is 0 while a download/flash is in progress. last_ota_result/age let the server see the
+  // true state (never a placeholder).
+  long otaAgeS = (long)((millis() - lastOtaAt) / 1000);
+  long otaInS  = otaInProgress ? 0 : ((long)(OTA_CHECK_INTERVAL / 1000) - otaAgeS);
+  if (otaInS < 0) otaInS = 0;
   String body = String("{\"firmware_version\":\"") + FW_VERSION +
                 "\",\"ip\":\"" + ip +
                 "\",\"rssi\":" + String(rssi) +
@@ -528,8 +533,10 @@ void sendHeartbeat() {
                 ",\"reader_ok\":" + (rc522Ok ? "true" : "false") +           // reader detected & configured
                 ",\"reader_ver\":\"0x" + String(lastReaderVersion, HEX) + "\"" +  // RC522 version byte
                 ",\"tag\":\"" + currentUID + "\"" +                          // UID currently held ("" = none)
-                ",\"ota_in_s\":" + String(otaInS) +                          // seconds to next OTA check
-                ",\"ota_interval_s\":" + String(OTA_CHECK_INTERVAL / 1000) + // OTA check period
+                ",\"ota_in_s\":" + String(otaInS) +                          // seconds to next OTA check (0 = in progress)
+                ",\"ota_interval_s\":" + String(OTA_CHECK_INTERVAL / 1000) + // real OTA check period
+                ",\"last_ota_result\":\"" + lastOtaResult + "\"" +           // ok|no_update|http_404|flash_fail|wifi_down|pending
+                ",\"last_ota_check_age_s\":" + String(otaAgeS) +            // seconds since the last check returned
                 ",\"boot\":" + (firstBeat ? "true" : "false") + "}";
   String resp;
   int code = postJson(HEARTBEAT_URL, body, resp);
@@ -585,34 +592,48 @@ void saveShotCount() {
 }
 
 void checkOTA() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED) { lastOtaResult = "wifi_down"; return; }
   WiFiClientSecure client; client.setInsecure();
   HTTPClient http;
   http.setConnectTimeout(5000);
   http.setTimeout(5000);
-  if (!http.begin(client, FW_VERSION_URL)) return;
+  if (!http.begin(client, FW_VERSION_URL)) { lastOtaResult = "begin_fail"; return; }
   int code = http.GET();
-  if (code == 200) {
-    String body = http.getString(); body.trim();
-    int nl = body.indexOf('\n');
-    String remoteVer = (nl < 0) ? body : body.substring(0, nl);
-    String target    = (nl < 0) ? "all" : body.substring(nl + 1);
-    remoteVer.trim(); target.trim();
-    bool targeted = (target == "all" || target == String(boardNum) || target == deviceId);
-    if (targeted && versionNewer(remoteVer, FW_VERSION)) {
-      Serial.println("[ota] " + String(FW_VERSION) + " -> " + remoteVer + " ... downloading");
-      http.end();
-      if (injectionArmed)                                          // no ISR during flash write
-        for (int i = 0; i < NUM_SIGNALS; i++) detachInterrupt(digitalPinToInterrupt(machineSignals[i].pin));
-      WiFiClientSecure up; up.setInsecure();
-      httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-      t_httpUpdate_return r = httpUpdate.update(up, FIRMWARE_URL);
-      if (r == HTTP_UPDATE_FAILED)
-        Serial.println("[ota] FAILED: " + String(httpUpdate.getLastError()) + " " + httpUpdate.getLastErrorString());
-      return;
-    }
+  if (code != 200) {                                             // version file unreachable (e.g. 404)
+    http.end();
+    lastOtaResult = "http_" + String(code);
+    return;
   }
+  String body = http.getString(); body.trim();
   http.end();
+  int nl = body.indexOf('\n');
+  String remoteVer = (nl < 0) ? body : body.substring(0, nl);
+  String target    = (nl < 0) ? "all" : body.substring(nl + 1);
+  remoteVer.trim(); target.trim();
+  bool targeted = (target == "all" || target == String(boardNum) || target == deviceId);
+  if (!(targeted && versionNewer(remoteVer, FW_VERSION))) {      // nothing newer for this board
+    lastOtaResult = "no_update";
+    return;
+  }
+  // A newer, targeted build exists -> download + flash. On success httpUpdate auto-reboots (we won't
+  // return); on failure we record why.
+  Serial.println("[ota] " + String(FW_VERSION) + " -> " + remoteVer + " ... downloading");
+  if (injectionArmed)                                            // no ISR during flash write
+    for (int i = 0; i < NUM_SIGNALS; i++) detachInterrupt(digitalPinToInterrupt(machineSignals[i].pin));
+  otaInProgress = true;
+  WiFiClientSecure up; up.setInsecure();
+  httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  t_httpUpdate_return r = httpUpdate.update(up, FIRMWARE_URL);
+  otaInProgress = false;
+  if (r == HTTP_UPDATE_FAILED) {
+    int err = httpUpdate.getLastError();
+    lastOtaResult = (err == HTTP_UE_SERVER_FILE_NOT_FOUND || err == HTTP_UE_SERVER_FORBIDDEN) ? "http_404" : "flash_fail";
+    Serial.println("[ota] FAILED: " + String(err) + " " + httpUpdate.getLastErrorString());
+  } else if (r == HTTP_UPDATE_NO_UPDATES) {
+    lastOtaResult = "no_update";
+  } else {
+    lastOtaResult = "ok";                                        // reached only if reboot is somehow deferred
+  }
 }
 
 // A KNOWN-GOOD RC522 version byte. Real MFRC522s report 0x91/0x92 (NXP) or 0x88/0x90/0xB2/0x12 (clones).
@@ -1072,8 +1093,8 @@ void loop() {
   }
 
   if (now - lastOtaAt >= OTA_CHECK_INTERVAL) {
-    lastOtaAt = now;
-    checkOTA();
+    checkOTA();                 // run the check...
+    lastOtaAt = millis();       // ...then stamp the timer on RETURN (success or failure), per the OTA spec
   }
 
   if (now - lastRfidPollAt >= RFID_POLL_INTERVAL) {
