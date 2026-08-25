@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.85"
+#define FW_VERSION "1.0.86"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -109,7 +109,10 @@ const unsigned long REINIT_INTERVAL      = 8000;     // while hunting for a tag,
 const unsigned long FIELD_REFRESH_INTERVAL = 20000;  // while a tag is present, proactively blink the field
                                                      // this often so it never sits in a continuous field
                                                      // long enough to go unresponsive (prevents sticking).
-const unsigned long OFFLINE_REBOOT_TIMEOUT = 60000;  // no server contact for 60s -> self-reboot
+const unsigned long OFFLINE_REBOOT_TIMEOUT = 120000; // no server contact for 120s -> self-reboot. 120s (was
+                                                     // 60s) tolerates a transient server slowdown under bulk
+                                                     // load (many boards writing at once) so the whole fleet
+                                                     // doesn't reboot-loop together.
 const unsigned long READER_STUCK_REBOOT_MS = 45000;  // held a tag, then reader reads NOTHING (no UID, not
                                                      // even a bare field answer) for this long -> the reader
                                                      // has wedged in the way only a reboot clears (same as
@@ -202,6 +205,10 @@ int postJson(const char* url, const String& body, String& respOut) {
   int code = http.POST(body);
   respOut = http.getString();
   http.end();
+  // ANY successful post (heartbeat, tag event, command result, machine event) counts as server contact.
+  // This stops the offline watchdog from rebooting a board that is busy and successfully talking to the
+  // server (e.g. processing a queue of writes) just because a plain heartbeat hasn't fired in a while.
+  if (code >= 200 && code < 300) lastGoodContactAt = millis();
   return code;
 }
 
@@ -997,16 +1004,18 @@ String readTagUid() {
 // scan - full for a distance tag down to very-low for a close/over-coupled one - so whatever the coupling,
 // one level reads it in a single pass. Snaps back to full at the end so the steady distance field is kept.
 String sweepReadLevels() {
-  static const byte lvl[4][3] = {
-    { 0xFF, 0x3F, 0x3F },   // full   - distance tag (unchanged behaviour)
+  static const byte lvl[6][3] = {
+    { 0xFF, 0x3F, 0x3F },   // full     - distance tag (unchanged behaviour)
+    { 0xAA, 0x28, 0x28 },   // high-mid
     { 0x88, 0x20, 0x20 },   // medium
-    { 0x44, 0x10, 0x10 },   // low    - close tag over-coupling the strong field
-    { 0x22, 0x08, 0x08 },   // v.low  - very close tag
+    { 0x44, 0x10, 0x10 },   // low      - close tag over-coupling the strong field
+    { 0x22, 0x08, 0x08 },   // v.low    - very close tag
+    { 0x11, 0x04, 0x04 },   // lowest   - severe over-couple, tag almost touching the antenna
   };
   String u = "";
-  for (int L = 0; L < 4 && u == ""; L++) {
+  for (int L = 0; L < 6 && u == ""; L++) {
     setAntennaDrive(lvl[L][0], lvl[L][1], lvl[L][2]);
-    for (int a = 0; a < 2 && u == ""; a++) u = tryReadOnce();
+    for (int a = 0; a < 3 && u == ""; a++) u = tryReadOnce();
   }
   setAntennaDrive(0xFF, 0x3F, 0x3F);   // restore full drive for the steady field
   return u;
