@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.80"
+#define FW_VERSION "1.0.81"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -615,12 +615,21 @@ void checkOTA() {
   http.end();
 }
 
-// Read the RC522 version register with retries (long cables give occasional bad reads).
+// A KNOWN-GOOD RC522 version byte. Real MFRC522s report 0x91/0x92 (NXP) or 0x88/0x90/0xB2/0x12 (clones).
+// Anything else - 0x00, 0xFF, or garbage like 0xEE - means the SPI link is returning junk (loose/miswired/
+// noisy reader), NOT a working reader. The old check only rejected 0x00/0xFF, so a garbage 0xEE was wrongly
+// accepted as "healthy" and the reader was never recovered. Reject anything not on this list.
+bool isValidReaderVersion(byte v) {
+  return v == 0x91 || v == 0x92 || v == 0x88 || v == 0x90 || v == 0xB2 || v == 0x12;
+}
+
+// Read the RC522 version register with retries (long cables give occasional bad reads). Retry until we get
+// a VALID version (not just non-zero), so one garbage read doesn't get latched as the reader's identity.
 byte readReaderVersion() {
   byte v = 0;
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 6; i++) {
     v = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
-    if (v != 0x00 && v != 0xFF) break;
+    if (isValidReaderVersion(v)) break;
     delay(5);
   }
   return v;
@@ -642,7 +651,7 @@ void startRC522() {
   delay(50);
   byte v = readReaderVersion();
   lastReaderVersion = v;
-  rc522Ok = (v != 0x00 && v != 0xFF);
+  rc522Ok = isValidReaderVersion(v);
   if (rc522Ok) {
     mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_max);        // max receive sensitivity (48 dB)
     mfrc522.PCD_AntennaOn();
@@ -674,7 +683,7 @@ void serviceReader() {
   static byte missCount = 0;
   byte v = readReaderVersion();
   lastReaderVersion = v;
-  bool present = (v != 0x00 && v != 0xFF);
+  bool present = isValidReaderVersion(v);       // garbage version (0xEE etc.) = bad SPI, treat as NOT present
   if (present) {
     missCount = 0;
     // Re-init when either (a) we don't think a reader is up, or (b) a reader IS present but
