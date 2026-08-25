@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.89"
+#define FW_VERSION "1.0.90"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -499,16 +499,21 @@ bool writeNdefTag(const String& url, const String& text, String& detail, String&
   tlv[tn++] = 0xFE;                                     // terminator TLV
   while (tn % 4 != 0) tlv[tn++] = 0x00;                 // pad to whole pages
   int pages = tn / 4;
+  // WARM-UP: hold the field on briefly before the first write so a MARGINALLY-COUPLED tag charges its
+  // internal capacitor fully - an EEPROM page write needs a current pulse the tag can only deliver when
+  // charged, which is why a weak seat fails at the very first data page even though the select succeeded.
+  delay(40);
   for (int pg = 0; pg < pages; pg++) {
     byte page[4] = { tlv[pg*4], tlv[pg*4+1], tlv[pg*4+2], tlv[pg*4+3] };
     // Retry each page: a tag that slips out of the field mid-write (weak coupling) fails one page even
     // though it's not locked. On failure re-grab the tag and retry this page before giving up, so a
     // marginal seat still completes instead of aborting the whole write.
     bool wrote = false;
-    for (int attempt = 0; attempt < 4 && !wrote; attempt++) {
+    for (int attempt = 0; attempt < 6 && !wrote; attempt++) {   // 6 tries (was 4) for a marginal seat
       if (mfrc522.MIFARE_Ultralight_Write((byte)(4 + pg), page, 4) == MFRC522::STATUS_OK) { wrote = true; break; }
       delay(10);
       reselectForWrite();                                // tag dropped out -> re-select and retry this page
+      delay(30);                                         // warm-up: let the re-grabbed tag charge before retrying
     }
     if (!wrote) {
       // Don't GUESS "locked" - read the STATIC LOCK BYTES (page 2, bytes 2-3) and report the truth. If
