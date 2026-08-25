@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.84"
+#define FW_VERSION "1.0.85"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -504,10 +504,20 @@ bool writeNdefTag(const String& url, const String& text, String& detail, String&
       reselectForWrite();                                // tag dropped out -> re-select and retry this page
     }
     if (!wrote) {
-      // page 4 (pg==0) failing through every retry = the tag rejects the FIRST data write = genuinely
-      // locked/protected. A LATER page failing = the tag kept slipping out of the field mid-write.
-      detail = "ntag write failed at page " + String(4 + pg) + " after 4 tries (type=" + ttype + ") - " +
-               (pg == 0 ? "tag LOCKED/protected" : "tag slipped out of field mid-write - reposition/steady it");
+      // Don't GUESS "locked" - read the STATIC LOCK BYTES (page 2, bytes 2-3) and report the truth. If
+      // they're set, the tag is genuinely locked (irreversible - replace it). If they're CLEAR, a blank
+      // read/write tag is NOT locked and the write failed for another reason (weak reader/coupling on this
+      // board, or password protection) - so we don't tell the user to bin a good tag.
+      byte lk[18]; byte lkl = sizeof(lk); byte l0 = 0xFF, l1 = 0xFF;
+      if (mfrc522.MIFARE_Read(2, lk, &lkl) == MFRC522::STATUS_OK) { l0 = lk[2]; l1 = lk[3]; }
+      bool reallyLocked = (l0 != 0x00 || l1 != 0x00);
+      String hex = "0x" + String(l0, HEX) + " 0x" + String(l1, HEX);
+      if (pg == 0 && reallyLocked)
+        detail = "tag LOCKED - static lock bytes " + hex + " set (irreversible; replace this tag) (type=" + ttype + ")";
+      else if (pg == 0)
+        detail = "page 4 write failed but lock bytes CLEAR (" + hex + ") - NOT locked; weak reader/coupling on this board or password - reposition tag / check reader (type=" + ttype + ")";
+      else
+        detail = "ntag write failed at page " + String(4 + pg) + " - tag slipped out of field mid-write, reposition/steady it (type=" + ttype + ")";
       mfrc522.PICC_HaltA(); return false;
     }
     delay(5);                                            // let the NTAG commit the page before the next write
