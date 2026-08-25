@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.79"
+#define FW_VERSION "1.0.80"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -389,6 +389,16 @@ String decodeNdefText(const byte* d, int len) {
   return uriOut;
 }
 
+// Re-grab a tag that slipped out of the field mid-write: quick select at full power, and if that fails
+// dip to low power (an over-coupled CLOSE tag re-selects better on a weaker field) then restore full.
+bool reselectForWrite() {
+  if (selectTagWithin(300)) return true;
+  setAntennaDrive(0x44, 0x10, 0x10);
+  bool ok = selectTagWithin(300);
+  setAntennaDrive(0xFF, 0x3F, 0x3F);
+  return ok;
+}
+
 bool writeNdefTag(const String& url, const String& text, String& detail, String& readBack) {
   if (!rc522Ok) { detail = "reader not detected"; return false; }
   if (!selectTagWithin(2000)) { detail = "no tag on reader (2s scan)"; return false; }
@@ -408,10 +418,23 @@ bool writeNdefTag(const String& url, const String& text, String& detail, String&
   int pages = tn / 4;
   for (int pg = 0; pg < pages; pg++) {
     byte page[4] = { tlv[pg*4], tlv[pg*4+1], tlv[pg*4+2], tlv[pg*4+3] };
-    if (mfrc522.MIFARE_Ultralight_Write((byte)(4 + pg), page, 4) != MFRC522::STATUS_OK) {
-      detail = "ntag write failed at page " + String(4 + pg) + " (type=" + ttype + ")";
+    // Retry each page: a tag that slips out of the field mid-write (weak coupling) fails one page even
+    // though it's not locked. On failure re-grab the tag and retry this page before giving up, so a
+    // marginal seat still completes instead of aborting the whole write.
+    bool wrote = false;
+    for (int attempt = 0; attempt < 4 && !wrote; attempt++) {
+      if (mfrc522.MIFARE_Ultralight_Write((byte)(4 + pg), page, 4) == MFRC522::STATUS_OK) { wrote = true; break; }
+      delay(10);
+      reselectForWrite();                                // tag dropped out -> re-select and retry this page
+    }
+    if (!wrote) {
+      // page 4 (pg==0) failing through every retry = the tag rejects the FIRST data write = genuinely
+      // locked/protected. A LATER page failing = the tag kept slipping out of the field mid-write.
+      detail = "ntag write failed at page " + String(4 + pg) + " after 4 tries (type=" + ttype + ") - " +
+               (pg == 0 ? "tag LOCKED/protected" : "tag slipped out of field mid-write - reposition/steady it");
       mfrc522.PICC_HaltA(); return false;
     }
+    delay(5);                                            // let the NTAG commit the page before the next write
   }
   byte back[256]; int backLen = 0;
   for (int pg = 0; pg < pages + 2 && backLen + 16 <= (int)sizeof(back); pg += 4) {
