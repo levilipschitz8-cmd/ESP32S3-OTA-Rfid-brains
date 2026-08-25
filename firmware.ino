@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.83"
+#define FW_VERSION "1.0.84"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -391,6 +391,59 @@ String decodeNdefText(const byte* d, int len) {
   return uriOut;
 }
 
+// Like decodeNdefText but returns BOTH the first TEXT record (lang byte skipped) and the first URI record
+// via reference params, so a read can report them separately (read_back = text, detail = uri).
+void decodeNdefRecords(const byte* d, int len, String& textOut, String& uriOut) {
+  textOut = ""; uriOut = "";
+  int i = 0, msgLen = -1, msgStart = -1;
+  while (i < len) {
+    byte t = d[i++];
+    if (t == 0x00) continue;
+    if (t == 0xFE) break;
+    if (i >= len) break;
+    int l = d[i++];
+    if (l == 0xFF) { if (i + 1 >= len) break; l = (d[i] << 8) | d[i+1]; i += 2; }
+    if (t == 0x03) { msgLen = l; msgStart = i; break; }
+    i += l;
+  }
+  if (msgStart < 0) return;
+  int p = msgStart, end = msgStart + msgLen;
+  if (end > len) end = len;
+  while (p < end) {
+    byte hdr = d[p++]; bool sr = hdr & 0x10; bool il = hdr & 0x08;
+    if (p >= end) break;
+    int typeLen = d[p++];
+    long payLen;
+    if (sr) payLen = d[p++];
+    else { if (p + 3 >= end) break; payLen = ((long)d[p]<<24)|((long)d[p+1]<<16)|((long)d[p+2]<<8)|d[p+3]; p += 4; }
+    int idLen = 0; if (il) { if (p >= end) break; idLen = d[p++]; }
+    if (p + typeLen > end) break;
+    char type = (typeLen >= 1) ? (char)d[p] : 0;
+    p += typeLen + idLen;
+    if (p + payLen > end) payLen = end - p;
+    if (type == 'T' && payLen >= 1 && textOut.length() == 0) {
+      int langLen = d[p] & 0x3F;
+      int txtStart = p + 1 + langLen, txtLen = payLen - 1 - langLen;
+      for (int k = 0; k < txtLen && txtStart + k < end; k++) textOut += (char)d[txtStart + k];
+    } else if (type == 'U' && payLen >= 1 && uriOut.length() == 0) {
+      const char* pfx = "";
+      switch (d[p]) { case 0x01: pfx="http://www."; break; case 0x02: pfx="https://www."; break;
+                      case 0x03: pfx="http://"; break; case 0x04: pfx="https://"; break; }
+      uriOut = pfx;
+      for (int k = 1; k < payLen && p + k < end; k++) uriOut += (char)d[p + k];
+    }
+    p += payLen;
+  }
+}
+
+// NTAG storage size from the CC size byte (page 3, byte 2).
+String ntagTypeFromCCSize(byte sizeByte) {
+  if (sizeByte == 0x12) return "ntag213";
+  if (sizeByte == 0x3E) return "ntag215";
+  if (sizeByte == 0x6D) return "ntag216";
+  return "unknown";
+}
+
 // Re-grab a tag that slipped out of the field mid-write: quick select at full power, and if that fails
 // dip to low power (an over-coupled CLOSE tag re-selects better on a weaker field) then restore full.
 bool reselectForWrite() {
@@ -486,6 +539,53 @@ void postCommandResultNdef(const String& cmdId, const String& status, const Stri
   Serial.println("[cmd] ndef " + status + " read_back='" + readBack + "' -> code=" + String(code));
 }
 
+// Result poster for read_ndef: includes tag_uid + tag_type alongside read_back + detail.
+void postCommandResultRead(const String& cmdId, const String& status, const String& tagUid,
+                           const String& tagType, const String& readBack, const String& detail) {
+  String resp;
+  String body = "{\"command_id\":\"" + cmdId + "\",\"status\":\"" + status +
+                "\",\"tag_uid\":\"" + jsonEscape(tagUid) + "\",\"tag_type\":\"" + jsonEscape(tagType) +
+                "\",\"read_back\":\"" + jsonEscape(readBack) + "\",\"detail\":\"" + jsonEscape(detail) + "\"}";
+  int code = postJson(CMD_RESULT_URL, body, resp);
+  Serial.println("[cmd] read_ndef " + status + " uid=" + tagUid + " type=" + tagType +
+                 " text='" + readBack + "' -> code=" + String(code));
+}
+
+// READ-ONLY: scan for a tag, decode its NDEF, and report it. Writes NOTHING (no page writes, no lock bytes).
+void readNdefTag(const String& cmdId) {
+  if (!rc522Ok) { postCommandResultRead(cmdId, "fail", "", "unknown", "", "reader not detected"); return; }
+  if (!selectTagWithin(2000)) { postCommandResult(cmdId, "fail", "no tag on reader (2s scan)"); return; }
+  String uid = uidToString(mfrc522.uid);
+  byte sak = mfrc522.uid.sak;
+  String tagType, textOut = "", uriOut = "";
+  int bytesRead = 0;
+  if (sak != 0x00) {                                   // MIFARE Classic: auth + read block 4
+    tagType = "classic";
+    byte buf[18]; byte bl = sizeof(buf);
+    if (mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, 4, &mifareKey, &mfrc522.uid) == MFRC522::STATUS_OK
+        && mfrc522.MIFARE_Read(4, buf, &bl) == MFRC522::STATUS_OK) {
+      bytesRead = 16;
+      decodeNdefRecords(buf, 16, textOut, uriOut);
+    }
+    mfrc522.PCD_StopCrypto1();
+  } else {                                             // NTAG/Ultralight: read pages 4..39
+    byte data[160]; int n = 0;
+    for (int pg = 4; pg <= 39 && n + 16 <= (int)sizeof(data); pg += 4) {
+      byte b[18]; byte bl = sizeof(b);
+      if (mfrc522.MIFARE_Read((byte)pg, b, &bl) != MFRC522::STATUS_OK) break;
+      for (int k = 0; k < 16; k++) data[n++] = b[k];
+    }
+    bytesRead = n;
+    byte cc[18]; byte ccl = sizeof(cc); byte ccSize = 0x00;   // CC size byte (page 3, byte 2) -> tag model
+    if (mfrc522.MIFARE_Read(3, cc, &ccl) == MFRC522::STATUS_OK) ccSize = cc[2];
+    tagType = ntagTypeFromCCSize(ccSize);
+    decodeNdefRecords(data, n, textOut, uriOut);
+  }
+  mfrc522.PICC_HaltA(); mfrc522.PCD_StopCrypto1();     // release the tag; normal polling (WUPA) resumes
+  String detail = uriOut.length() ? ("uri=" + uriOut) : ("read " + String(bytesRead) + " bytes");
+  postCommandResultRead(cmdId, "ok", uid, tagType, textOut, detail);
+}
+
 void handleCommand(const String& resp) {
   String cmd = jsonStr(resp, "command");
   if (cmd == "" || cmd == "null") return;
@@ -504,6 +604,9 @@ void handleCommand(const String& resp) {
     String detail, readBack;
     bool ok = writeNdefTag(url, text, detail, readBack);
     postCommandResultNdef(cmdId, ok ? "ok" : "fail", detail, readBack);
+  } else if (cmd == "read_ndef") {
+    Serial.println("[cmd] read_ndef id=" + cmdId);
+    readNdefTag(cmdId);                                 // read-only: decodes + reports, writes nothing
   } else if (cmd == "recover_reader") {
     // Backend-triggered recovery: the dashboard can send this when a board looks stale. Force the full
     // escalation (longer field blink + reader re-init) and re-scan, so a stuck reader/tag is revived
