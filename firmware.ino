@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.82"
+#define FW_VERSION "1.0.83"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -409,6 +409,27 @@ bool writeNdefTag(const String& url, const String& text, String& detail, String&
     detail = "not an NTAG (type=" + ttype + ", sak=0x" + String(mfrc522.uid.sak, HEX) + ")";
     mfrc522.PICC_HaltA(); return false;
   }
+  // Capability Container (page 3): a phone/tablet reads THIS FIRST to decide the tag is an NDEF tag at
+  // all. If it isn't E1 10 xx 00, the tag is invisible to phones even though the NDEF is written - our own
+  // read-back still decodes it, which is why "verified" tags wouldn't read on your tablet. A factory NTAG
+  // already has a valid CC (starts 0xE1) and we leave it; a blank/wiped tag gets a standard CC written.
+  {
+    byte cc[18]; byte ccLen = sizeof(cc);
+    bool haveCC = (mfrc522.MIFARE_Read(3, cc, &ccLen) == MFRC522::STATUS_OK && cc[0] == 0xE1);
+    if (!haveCC) {
+      byte ccPage[4] = { 0xE1, 0x10, 0x12, 0x00 };        // NDEF magic, v1.0, 144B (NTAG213), read/write
+      bool ccWrote = false;
+      for (int a = 0; a < 4 && !ccWrote; a++) {
+        if (mfrc522.MIFARE_Ultralight_Write(3, ccPage, 4) == MFRC522::STATUS_OK) ccWrote = true;
+        else { delay(10); reselectForWrite(); }
+      }
+      if (!ccWrote) {
+        detail = "capability container (page 3) write failed - tag locked? (type=" + ttype + ")";
+        mfrc522.PICC_HaltA(); return false;
+      }
+      delay(5);
+    }
+  }
   byte msg[240];
   int mlen = buildNdefMessage(url, text, msg, sizeof(msg));
   if (mlen < 0) { detail = "ndef empty or too large (type=" + ttype + ")"; mfrc522.PICC_HaltA(); return false; }
@@ -438,6 +459,11 @@ bool writeNdefTag(const String& url, const String& text, String& detail, String&
     }
     delay(5);                                            // let the NTAG commit the page before the next write
   }
+  // Honest verify: a phone reads the tag ONLY if the CC magic (page 3 byte 0) is 0xE1 AND page 4 begins
+  // with the NDEF TLV (0x03). Read both and report what a phone would actually see - not just whether our
+  // own decoder found the text.
+  byte cc3[18]; byte cc3Len = sizeof(cc3); byte ccMagic = 0x00;
+  if (mfrc522.MIFARE_Read(3, cc3, &cc3Len) == MFRC522::STATUS_OK) ccMagic = cc3[0];
   byte back[256]; int backLen = 0;
   for (int pg = 0; pg < pages + 2 && backLen + 16 <= (int)sizeof(back); pg += 4) {
     byte b[18]; byte bl = sizeof(b);
@@ -446,8 +472,10 @@ bool writeNdefTag(const String& url, const String& text, String& detail, String&
   }
   mfrc522.PICC_HaltA();
   readBack = decodeNdefText(back, backLen);
-  detail = "wrote+verified NDEF (" + String(pages) + " pages, type=" + ttype + ")";
-  return true;
+  bool phoneReadable = (ccMagic == 0xE1) && (backLen > 0) && (back[0] == 0x03);
+  detail = String(phoneReadable ? "wrote+verified NDEF, phone-readable" : "wrote NDEF but NOT phone-readable")
+           + " (" + String(pages) + " pages, CC=0x" + String(ccMagic, HEX) + ", type=" + ttype + ")";
+  return phoneReadable;   // report real usability: a tag a phone can't read is a failed write
 }
 
 void postCommandResultNdef(const String& cmdId, const String& status, const String& detail, const String& readBack) {
