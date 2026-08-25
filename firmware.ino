@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.87"
+#define FW_VERSION "1.0.88"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -1058,8 +1058,13 @@ void pollRfid() {
       if (sw == currentUID) { lastSeenAt = millis(); emptySince = 0; reprobeCount = 0; return; }
       if (sw != "") { adoptTag(sw); reprobeCount = 0; return; }
     }
-    // A weakly-coupled tag may still answer a bare field ping even when it can't complete a select.
-    if (tagAnswersField()) { lastSeenAt = millis(); emptySince = 0; reprobeCount = 0; return; }
+    // A weakly-coupled tag may still answer a bare field ping even when it can't complete a select - that
+    // holds a genuinely-present weak tag. BUT on the strong reader (M7) we must NOT trust a bare field
+    // answer to hold the UID: when you SWAP in a new tag it answers the field too, and holding the OLD
+    // UID here masks the swap and stops us re-reading/re-sweeping. So M7 requires a real UID (from the
+    // sweep above); if it can't get one, we DON'T hold on a bare answer - the removal window runs, the tag
+    // clears, and detect re-sweeps every poll to identify whatever tag is actually on the reader now.
+    if (!strongReader && tagAnswersField()) { lastSeenAt = millis(); emptySince = 0; reprobeCount = 0; return; }
 
     // No answer this pass. Before letting the removal window run, ESCALATE recovery: short antenna
     // blink -> longer blink -> full reader re-init. A sitting tag that has gone unresponsive answers
