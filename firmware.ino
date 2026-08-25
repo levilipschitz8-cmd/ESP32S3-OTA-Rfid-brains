@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.88"
+#define FW_VERSION "1.0.89"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -1027,8 +1027,12 @@ String sweepReadLevels() {
 }
 
 void pollRfid() {
-  // Machine 7's strong reader needs the multi-level power sweep; every other board keeps its proven path.
-  bool strongReader = (boardNum == 7 || deviceId == INJECTION_DEVICE_ID);
+  // REVERTED: Machine 7 now uses the SAME proven detection path as every other (working) board. The
+  // M7-only multi-level sweep I added (1.0.78/86/88) regressed detection that used to work, so it's
+  // disabled. The standard path still has a low-power dip for close/over-coupled tags. (Sweep code kept
+  // below but inert; flip this back on only if a real over-coupling case reappears AND the standard path
+  // can't handle it.)
+  bool strongReader = false;
   // ---- Holding a tracked tag: bias HEAVILY toward "still present" ----
   // A tag physically on the reader must NEVER falsely report "removed", even after months. Removal is
   // accepted ONLY when a HEALTHY reader confirms a genuinely empty field, continuously, for
