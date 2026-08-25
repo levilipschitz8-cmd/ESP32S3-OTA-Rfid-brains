@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.91"
+#define FW_VERSION "1.0.92"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -451,14 +451,42 @@ String ntagTypeFromCCSize(byte sizeByte) {
   return "unknown";
 }
 
-// Re-grab a tag that slipped out of the field mid-write: quick select at full power, and if that fails
-// dip to low power (an over-coupled CLOSE tag re-selects better on a weaker field) then restore full.
-bool reselectForWrite() {
-  if (selectTagWithin(300)) return true;
-  setAntennaDrive(0x44, 0x10, 0x10);
-  bool ok = selectTagWithin(300);
-  setAntennaDrive(0xFF, 0x3F, 0x3F);
-  return ok;
+// Shared antenna levels for tuning: TX drive AND RX gain stepped down together = "tag further away",
+// which is how an over-coupled CLOSE tag is read/written. Level 0 = full power/max gain (a distance tag).
+struct RfLevel { byte gsn, cwgsp, modgsp, rxgain; };
+const RfLevel RF_LEVELS[] = {
+  { 0xFF, 0x3F, 0x3F, 0x07 << 4 },   // full  TX + 48dB - distance tag
+  { 0x88, 0x20, 0x20, 0x06 << 4 },   //             43dB
+  { 0x44, 0x10, 0x10, 0x04 << 4 },   // low   TX + 33dB - close
+  { 0x22, 0x08, 0x08, 0x01 << 4 },   // v.low TX + 23dB - very close
+  { 0x11, 0x04, 0x04, 0x00 << 4 },   // min   TX + 18dB - severe over-couple
+};
+const int RF_NLEVELS = sizeof(RF_LEVELS) / sizeof(RF_LEVELS[0]);
+void setRfLevel(int i) {
+  if (i < 0) i = 0; if (i >= RF_NLEVELS) i = RF_NLEVELS - 1;
+  setAntennaDrive(RF_LEVELS[i].gsn, RF_LEVELS[i].cwgsp, RF_LEVELS[i].modgsp);
+  mfrc522.PCD_SetAntennaGain(RF_LEVELS[i].rxgain);
+}
+void setRfFull() { setRfLevel(0); }
+
+// Find the antenna level at which THIS tag SELECTS cleanly and LEAVE it set (tag selected) for the write.
+// A write needs good coupling even more than a read; writing at the level where the tag actually couples
+// (not blindly at full power, which OVER-couples a close tag) is what makes a close tag's write take.
+// Returns the level index, or -1 (restores full) if the tag won't select at any level.
+int tuneWriteLevel() {
+  for (int i = 0; i < RF_NLEVELS; i++) {
+    setRfLevel(i);
+    if (selectTagWithin(200)) return i;
+  }
+  setRfFull();
+  return -1;
+}
+
+// Re-grab a tag mid-write at a SPECIFIC tuned level (used between page-write retries so we stay at the
+// level the tag couples well, instead of snapping back to full and over-coupling a close tag again).
+bool reselectAtLevel(int level) {
+  setRfLevel(level);
+  return selectTagWithin(300);
 }
 
 bool writeNdefTag(const String& url, const String& text, String& detail, String& readBack) {
@@ -469,6 +497,12 @@ bool writeNdefTag(const String& url, const String& text, String& detail, String&
     detail = "not an NTAG (type=" + ttype + ", sak=0x" + String(mfrc522.uid.sak, HEX) + ")";
     mfrc522.PICC_HaltA(); return false;
   }
+  // Tune the antenna to THIS tag's best coupling level BEFORE writing. A write needs good coupling even
+  // more than a read; blasting full power OVER-couples a close tag and its write fails at page 4 (the exact
+  // "page 4 failed, lock bytes clear" symptom). tuneWriteLevel leaves the antenna at the level where the
+  // tag selects cleanly and the tag selected; we write there, then restore full on every exit below.
+  int wlvl = tuneWriteLevel();
+  if (wlvl < 0) wlvl = 0;
   // Capability Container (page 3): a phone/tablet reads THIS FIRST to decide the tag is an NDEF tag at
   // all. If it isn't E1 10 xx 00, the tag is invisible to phones even though the NDEF is written - our own
   // read-back still decodes it, which is why "verified" tags wouldn't read on your tablet. A factory NTAG
@@ -481,11 +515,11 @@ bool writeNdefTag(const String& url, const String& text, String& detail, String&
       bool ccWrote = false;
       for (int a = 0; a < 4 && !ccWrote; a++) {
         if (mfrc522.MIFARE_Ultralight_Write(3, ccPage, 4) == MFRC522::STATUS_OK) ccWrote = true;
-        else { delay(10); reselectForWrite(); }
+        else { delay(10); reselectAtLevel(wlvl); }
       }
       if (!ccWrote) {
         detail = "capability container (page 3) write failed - tag locked? (type=" + ttype + ")";
-        mfrc522.PICC_HaltA(); return false;
+        mfrc522.PICC_HaltA(); setRfFull(); return false;
       }
       delay(5);
     }
@@ -512,7 +546,7 @@ bool writeNdefTag(const String& url, const String& text, String& detail, String&
     for (int attempt = 0; attempt < 6 && !wrote; attempt++) {   // 6 tries (was 4) for a marginal seat
       if (mfrc522.MIFARE_Ultralight_Write((byte)(4 + pg), page, 4) == MFRC522::STATUS_OK) { wrote = true; break; }
       delay(10);
-      reselectForWrite();                                // tag dropped out -> re-select and retry this page
+      reselectAtLevel(wlvl);                             // re-grab at the tuned level (don't snap back to full)
       delay(30);                                         // warm-up: let the re-grabbed tag charge before retrying
     }
     if (!wrote) {
@@ -535,7 +569,7 @@ bool writeNdefTag(const String& url, const String& text, String& detail, String&
         detail = "page 4 write failed but lock bytes CLEAR (" + hex + ") - NOT locked; weak reader/coupling on this board or password - reposition tag / check reader (type=" + ttype + ")";
       else
         detail = "ntag write failed at page " + String(4 + pg) + " - tag slipped out of field mid-write, reposition/steady it (type=" + ttype + ")";
-      mfrc522.PICC_HaltA(); return false;
+      mfrc522.PICC_HaltA(); setRfFull(); return false;
     }
     delay(5);                                            // let the NTAG commit the page before the next write
   }
@@ -551,10 +585,11 @@ bool writeNdefTag(const String& url, const String& text, String& detail, String&
     for (int k = 0; k < 16; k++) back[backLen++] = b[k];
   }
   mfrc522.PICC_HaltA();
+  setRfFull();                                           // restore full drive + max gain for normal polling
   readBack = decodeNdefText(back, backLen);
   bool phoneReadable = (ccMagic == 0xE1) && (backLen > 0) && (back[0] == 0x03);
   detail = String(phoneReadable ? "wrote+verified NDEF, phone-readable" : "wrote NDEF but NOT phone-readable")
-           + " (" + String(pages) + " pages, CC=0x" + String(ccMagic, HEX) + ", type=" + ttype + ")";
+           + " (" + String(pages) + " pages @ RF level " + String(wlvl) + ", CC=0x" + String(ccMagic, HEX) + ", type=" + ttype + ")";
   return phoneReadable;   // report real usability: a tag a phone can't read is a failed write
 }
 
