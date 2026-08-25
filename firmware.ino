@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.77"
+#define FW_VERSION "1.0.78"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -796,7 +796,29 @@ String readTagUid() {
   return u;
 }
 
+// Machine 7 ONLY: its reader is strong and OVER-couples a close tag at full power, so a tag only reads at
+// certain distances/orientations (why turning it or waiting "worked"). Sweep several drive levels every
+// scan - full for a distance tag down to very-low for a close/over-coupled one - so whatever the coupling,
+// one level reads it in a single pass. Snaps back to full at the end so the steady distance field is kept.
+String sweepReadLevels() {
+  static const byte lvl[4][3] = {
+    { 0xFF, 0x3F, 0x3F },   // full   - distance tag (unchanged behaviour)
+    { 0x88, 0x20, 0x20 },   // medium
+    { 0x44, 0x10, 0x10 },   // low    - close tag over-coupling the strong field
+    { 0x22, 0x08, 0x08 },   // v.low  - very close tag
+  };
+  String u = "";
+  for (int L = 0; L < 4 && u == ""; L++) {
+    setAntennaDrive(lvl[L][0], lvl[L][1], lvl[L][2]);
+    for (int a = 0; a < 2 && u == ""; a++) u = tryReadOnce();
+  }
+  setAntennaDrive(0xFF, 0x3F, 0x3F);   // restore full drive for the steady field
+  return u;
+}
+
 void pollRfid() {
+  // Machine 7's strong reader needs the multi-level power sweep; every other board keeps its proven path.
+  bool strongReader = (boardNum == 7 || deviceId == INJECTION_DEVICE_ID);
   // ---- Holding a tracked tag: bias HEAVILY toward "still present" ----
   // A tag physically on the reader must NEVER falsely report "removed", even after months. Removal is
   // accepted ONLY when a HEALTHY reader confirms a genuinely empty field, continuously, for
@@ -819,6 +841,13 @@ void pollRfid() {
     setAntennaDrive(0xFF, 0x3F, 0x3F);
     if (low == currentUID) { lastSeenAt = millis(); emptySince = 0; reprobeCount = 0; return; }  // present (close)
     if (low != "") { adoptTag(low); reprobeCount = 0; return; }                   // a different close tag -> swap
+    // Machine 7: full multi-level sweep before giving up this pass, so an over-coupled tag sitting at a
+    // level between full and the single low dip is still confirmed present and HELD (not dropped).
+    if (strongReader) {
+      String sw = sweepReadLevels();
+      if (sw == currentUID) { lastSeenAt = millis(); emptySince = 0; reprobeCount = 0; return; }
+      if (sw != "") { adoptTag(sw); reprobeCount = 0; return; }
+    }
     // A weakly-coupled tag may still answer a bare field ping even when it can't complete a select.
     if (tagAnswersField()) { lastSeenAt = millis(); emptySince = 0; reprobeCount = 0; return; }
 
@@ -855,6 +884,10 @@ void pollRfid() {
   // so a DISTANCE tag reads here exactly as before - this is what the last sweep broke, fixed.
   String uid = "";
   for (int attempt = 0; attempt < 5 && uid == ""; attempt++) uid = tryReadOnce();
+  // Machine 7: if full power found nothing, sweep all drive levels THIS poll (no throttle) so a close/
+  // over-coupled tag is caught in one pass instead of only when it's moved/turned. Full-power-first above
+  // means a distance tag still reads exactly as before; this only adds the lower levels on top.
+  if (uid == "" && strongReader) uid = sweepReadLevels();
   // Only if full power found NOTHING (so there's no distance read to disturb), occasionally dip
   // to low power to catch a tag close enough to over-couple the strong field. Throttled to
   // CLOSE_PROBE_INTERVAL and snapped straight back to full, so the steady field is barely touched.
