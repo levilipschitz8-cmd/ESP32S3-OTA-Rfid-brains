@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.90"
+#define FW_VERSION "1.0.91"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -1009,35 +1009,37 @@ String readTagUid() {
   return u;
 }
 
-// Machine 7 ONLY: its reader is strong and OVER-couples a close tag at full power, so a tag only reads at
-// certain distances/orientations (why turning it or waiting "worked"). Sweep several drive levels every
-// scan - full for a distance tag down to very-low for a close/over-coupled one - so whatever the coupling,
-// one level reads it in a single pass. Snaps back to full at the end so the steady distance field is kept.
+// Machine 7 ONLY: its strong reader OVER-couples a close tag. Proven by the user: moving the reader AWAY
+// lets it read. Over-coupling has TWO parts - too much TX field AND the receiver saturating at max gain on
+// a close tag's huge load-modulation signal. Lowering ONLY TX (my earlier sweep) didn't fix it; we must
+// drop TX power AND RX gain together, which electronically emulates "the tag is further away" - the thing
+// that actually worked. Full/max first (a distance tag reads unchanged), then progressively "further away".
 String sweepReadLevels() {
-  static const byte lvl[6][3] = {
-    { 0xFF, 0x3F, 0x3F },   // full     - distance tag (unchanged behaviour)
-    { 0xAA, 0x28, 0x28 },   // high-mid
-    { 0x88, 0x20, 0x20 },   // medium
-    { 0x44, 0x10, 0x10 },   // low      - close tag over-coupling the strong field
-    { 0x22, 0x08, 0x08 },   // v.low    - very close tag
-    { 0x11, 0x04, 0x04 },   // lowest   - severe over-couple, tag almost touching the antenna
+  struct Lv { byte gsn, cwgsp, modgsp; byte rxgain; };
+  static const Lv lvl[] = {
+    { 0xFF, 0x3F, 0x3F, 0x07 << 4 },   // full  TX + max gain (48dB) - distance tag (unchanged behaviour)
+    { 0x88, 0x20, 0x20, 0x06 << 4 },   //                      43dB
+    { 0x44, 0x10, 0x10, 0x04 << 4 },   // low   TX +           33dB  - close over-coupled tag
+    { 0x22, 0x08, 0x08, 0x01 << 4 },   // v.low TX +           23dB  - very close tag
+    { 0x11, 0x04, 0x04, 0x00 << 4 },   // min   TX +           18dB  - severe over-couple, almost touching
   };
+  const int N = sizeof(lvl) / sizeof(lvl[0]);
   String u = "";
-  for (int L = 0; L < 6 && u == ""; L++) {
-    setAntennaDrive(lvl[L][0], lvl[L][1], lvl[L][2]);
+  for (int L = 0; L < N && u == ""; L++) {
+    setAntennaDrive(lvl[L].gsn, lvl[L].cwgsp, lvl[L].modgsp);
+    mfrc522.PCD_SetAntennaGain(lvl[L].rxgain);              // drop receiver gain too = "tag further away"
     for (int a = 0; a < 3 && u == ""; a++) u = tryReadOnce();
   }
-  setAntennaDrive(0xFF, 0x3F, 0x3F);   // restore full drive for the steady field
+  setAntennaDrive(0xFF, 0x3F, 0x3F);                        // restore full drive + max gain for the steady field
+  mfrc522.PCD_SetAntennaGain(0x07 << 4);
   return u;
 }
 
 void pollRfid() {
-  // REVERTED: Machine 7 now uses the SAME proven detection path as every other (working) board. The
-  // M7-only multi-level sweep I added (1.0.78/86/88) regressed detection that used to work, so it's
-  // disabled. The standard path still has a low-power dip for close/over-coupled tags. (Sweep code kept
-  // below but inert; flip this back on only if a real over-coupling case reappears AND the standard path
-  // can't handle it.)
-  bool strongReader = false;
+  // Machine 7's strong reader OVER-couples a close tag (proven: moving the reader away lets it read). The
+  // sweep (which now drops BOTH TX power and RX gain to emulate "tag further away") is what reads a close
+  // tag, so it's ON for M7 again.
+  bool strongReader = (boardNum == 7 || deviceId == INJECTION_DEVICE_ID);
   // ---- Holding a tracked tag: bias HEAVILY toward "still present" ----
   // A tag physically on the reader must NEVER falsely report "removed", even after months. Removal is
   // accepted ONLY when a HEALTHY reader confirms a genuinely empty field, continuously, for
@@ -1073,7 +1075,7 @@ void pollRfid() {
     // UID here masks the swap and stops us re-reading/re-sweeping. So M7 requires a real UID (from the
     // sweep above); if it can't get one, we DON'T hold on a bare answer - the removal window runs, the tag
     // clears, and detect re-sweeps every poll to identify whatever tag is actually on the reader now.
-    if (!strongReader && tagAnswersField()) { lastSeenAt = millis(); emptySince = 0; reprobeCount = 0; return; }
+    if (tagAnswersField()) { lastSeenAt = millis(); emptySince = 0; reprobeCount = 0; return; }
 
     // No answer this pass. Before letting the removal window run, ESCALATE recovery: short antenna
     // blink -> longer blink -> full reader re-init. A sitting tag that has gone unresponsive answers
