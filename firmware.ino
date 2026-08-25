@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.86"
+#define FW_VERSION "1.0.87"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -515,11 +515,16 @@ bool writeNdefTag(const String& url, const String& text, String& detail, String&
       // they're set, the tag is genuinely locked (irreversible - replace it). If they're CLEAR, a blank
       // read/write tag is NOT locked and the write failed for another reason (weak reader/coupling on this
       // board, or password protection) - so we don't tell the user to bin a good tag.
-      byte lk[18]; byte lkl = sizeof(lk); byte l0 = 0xFF, l1 = 0xFF;
-      if (mfrc522.MIFARE_Read(2, lk, &lkl) == MFRC522::STATUS_OK) { l0 = lk[2]; l1 = lk[3]; }
-      bool reallyLocked = (l0 != 0x00 || l1 != 0x00);
+      byte lk[18]; byte lkl = sizeof(lk);
+      bool lkRead = (mfrc522.MIFARE_Read(2, lk, &lkl) == MFRC522::STATUS_OK);   // did the page-2 read succeed?
+      byte l0 = lkRead ? lk[2] : 0x00, l1 = lkRead ? lk[3] : 0x00;
+      bool reallyLocked = lkRead && (l0 != 0x00 || l1 != 0x00);
       String hex = "0x" + String(l0, HEX) + " 0x" + String(l1, HEX);
-      if (pg == 0 && reallyLocked)
+      if (pg == 0 && !lkRead)
+        // Could NOT even read the lock bytes -> the reader can't read this tag at all (coupling/wedge on
+        // this board). NOT proof of a lock. Don't tell the user to replace a good tag.
+        detail = "write failed AND lock bytes UNREADABLE - reader can't read this tag (coupling/wedge on this board), not necessarily locked - reposition tag / power-cycle & retry (type=" + ttype + ")";
+      else if (pg == 0 && reallyLocked)
         detail = "tag LOCKED - static lock bytes " + hex + " set (irreversible; replace this tag) (type=" + ttype + ")";
       else if (pg == 0)
         detail = "page 4 write failed but lock bytes CLEAR (" + hex + ") - NOT locked; weak reader/coupling on this board or password - reposition tag / check reader (type=" + ttype + ")";
