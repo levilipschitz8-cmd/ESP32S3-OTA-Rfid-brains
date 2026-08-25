@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.94"
+#define FW_VERSION "1.0.95"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -92,6 +92,7 @@ int           reprobeCount = 0;        // escalating recovery step count for the
 unsigned long lastLevelSnapAt = 0;      // last raw pin-level snapshot POST (machine 7 diagnostic)
 unsigned long lastRawPrintAt = 0;       // last 1 Hz RAW serial print (machine 7 diagnostic)
 unsigned long lastReinitAt = 0;         // last FULL reader re-init while hunting for a tag (auto-recovery)
+unsigned long readerDownSince = 0;      // when the reader first went invalid/disconnected (0 = reader ok)
 
 const unsigned long HEARTBEAT_INTERVAL   = 5000;
 const unsigned long RFID_POLL_INTERVAL   = 250;
@@ -109,6 +110,9 @@ const unsigned long REINIT_INTERVAL      = 8000;     // while hunting for a tag,
 const unsigned long FIELD_REFRESH_INTERVAL = 20000;  // while a tag is present, proactively blink the field
                                                      // this often so it never sits in a continuous field
                                                      // long enough to go unresponsive (prevents sticking).
+const unsigned long READER_DOWN_CLEAR_MS = 30000;    // reader invalid/disconnected this long (not a glitch)
+                                                     // -> stop asserting a phantom held tag (no reader can
+                                                     // confirm it). Prevents "present" on an unplugged reader.
 const unsigned long OFFLINE_REBOOT_TIMEOUT = 120000; // no server contact for 120s -> self-reboot. 120s (was
                                                      // 60s) tolerates a transient server slowdown under bulk
                                                      // load (many boards writing at once) so the whole fleet
@@ -922,6 +926,7 @@ void serviceReader() {
   bool present = isValidReaderVersion(v);       // garbage version (0xEE etc.) = bad SPI, treat as NOT present
   if (present) {
     missCount = 0;
+    readerDownSince = 0;                        // reader is back/alive -> clear the disconnected timer
     // Re-init when either (a) we don't think a reader is up, or (b) a reader IS present but
     // is NOT carrying our configuration. Case (b) is the HOT-SWAP fix: if you pull one reader
     // and plug another in between version checks, rc522Ok never goes false, so the new reader
@@ -940,6 +945,7 @@ void serviceReader() {
     // a manual reset (exactly "tag presence randomly goes down and stays down"). The RST pulse
     // in startRC522 un-sticks it, so it recovers by itself.
     if (++missCount >= 2) {
+      if (readerDownSince == 0) readerDownSince = millis();   // stamp when the reader first went down
       if (rc522Ok) {
         rc522Ok = false;
         Serial.println("[rc522] reader lost - attempting recovery");
@@ -1104,7 +1110,22 @@ void pollRfid() {
   // serviceReader recover it. A weakly-coupled tag that only answers a bare field ping still counts as
   // present. A different UID appearing is handled as a swap (removed old + present new).
   if (currentUID != "") {
-    if (!rc522Ok) { emptySince = 0; return; }          // reader down -> hold, recover in background
+    if (!rc522Ok) {                                    // reader down
+      // Hold the tag through a BRIEF glitch (don't false-remove). But if the reader has been dead/
+      // disconnected for READER_DOWN_CLEAR_MS (genuinely unplugged, not a glitch), stop asserting a
+      // phantom tag - there is no reader to confirm it, so reporting "present" is just wrong (this is the
+      // "says a tag is in place when the reader isn't even connected"). Clear it; it re-detects if the
+      // reader comes back.
+      if (readerDownSince && millis() - readerDownSince > READER_DOWN_CLEAR_MS) {
+        Serial.println("Reader disconnected >" + String(READER_DOWN_CLEAR_MS / 1000) +
+                       "s - clearing phantom tag: " + currentUID);
+        postTagEvent(currentUID, "removed");
+        currentUID = ""; emptySince = 0; everSawTag = false;
+      } else {
+        emptySince = 0;
+      }
+      return;
+    }
 
     // Read the tag at FULL power: confirms the exact UID and catches a swap to a different tag.
     String seen = readTagUid();
