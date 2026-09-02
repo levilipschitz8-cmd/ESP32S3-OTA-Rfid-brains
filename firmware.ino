@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.98"
+#define FW_VERSION "1.0.99"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -1108,10 +1108,12 @@ String sweepReadLevels() {
 }
 
 void pollRfid() {
-  // Machine 7's strong reader OVER-couples a close tag (proven: moving the reader away lets it read). The
-  // sweep (which now drops BOTH TX power and RX gain to emulate "tag further away") is what reads a close
-  // tag, so it's ON for M7 again.
-  bool strongReader = (boardNum == 7 || deviceId == INJECTION_DEVICE_ID);
+  // Over-coupling (a strong RC522 can't read a CLOSE tag at full power) affects MANY boards in the fleet,
+  // not just M7 - Mixer, the production boards, etc. The sweep (drop BOTH TX power and RX gain to emulate
+  // "tag further away") only runs when full power finds nothing, so a distance tag reads unchanged and this
+  // only ADDS the ability to find a close over-coupled tag. So run it on EVERY board's detection - the write
+  // path already sweeps fleet-wide, and detection must too so a close tag is always found automatically.
+  bool strongReader = true;
   // ---- Holding a tracked tag: bias HEAVILY toward "still present" ----
   // A tag physically on the reader must NEVER falsely report "removed", even after months. Removal is
   // accepted ONLY when a HEALTHY reader confirms a genuinely empty field, continuously, for
