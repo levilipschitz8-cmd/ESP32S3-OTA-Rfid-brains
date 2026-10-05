@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.0.99"
+#define FW_VERSION "1.1.0"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -1087,23 +1087,16 @@ String readTagUid() {
 // drop TX power AND RX gain together, which electronically emulates "the tag is further away" - the thing
 // that actually worked. Full/max first (a distance tag reads unchanged), then progressively "further away".
 String sweepReadLevels() {
-  struct Lv { byte gsn, cwgsp, modgsp; byte rxgain; };
-  static const Lv lvl[] = {
-    { 0xFF, 0x3F, 0x3F, 0x07 << 4 },   // full  TX + max gain (48dB) - distance tag (unchanged behaviour)
-    { 0x88, 0x20, 0x20, 0x06 << 4 },   //                      43dB
-    { 0x44, 0x10, 0x10, 0x04 << 4 },   // low   TX +           33dB  - close over-coupled tag
-    { 0x22, 0x08, 0x08, 0x01 << 4 },   // v.low TX +           23dB  - very close tag
-    { 0x11, 0x04, 0x04, 0x00 << 4 },   // min   TX +           18dB  - severe over-couple, almost touching
-  };
-  const int N = sizeof(lvl) / sizeof(lvl[0]);
+  // Use the SHARED RF_LEVELS table (same one the write path uses) so detection sweeps exactly as low as
+  // writing does - down to the ultra-low/floor levels for the strongest over-coupling readers. These were
+  // added to RF_LEVELS for writes but the read sweep had its own shorter table and only went to 0x11, so a
+  // very strong reader could WRITE a close tag but never DETECT it. One table now fixes that fleet-wide.
   String u = "";
-  for (int L = 0; L < N && u == ""; L++) {
-    setAntennaDrive(lvl[L].gsn, lvl[L].cwgsp, lvl[L].modgsp);
-    mfrc522.PCD_SetAntennaGain(lvl[L].rxgain);              // drop receiver gain too = "tag further away"
+  for (int L = 0; L < RF_NLEVELS && u == ""; L++) {
+    setRfLevel(L);                                         // steps BOTH TX drive and RX gain down together
     for (int a = 0; a < 3 && u == ""; a++) u = tryReadOnce();
   }
-  setAntennaDrive(0xFF, 0x3F, 0x3F);                        // restore full drive + max gain for the steady field
-  mfrc522.PCD_SetAntennaGain(0x07 << 4);
+  setRfFull();                                             // restore full drive + max gain for the steady field
   return u;
 }
 
