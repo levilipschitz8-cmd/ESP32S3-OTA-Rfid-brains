@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.1.0"
+#define FW_VERSION "1.1.1"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -25,6 +25,7 @@ const char* FW_VERSION_URL  = "https://raw.githubusercontent.com/levilipschitz8-
 const char* FIRMWARE_URL    = "https://github.com/levilipschitz8-cmd/ESP32S3-OTA-Rfid-brains/releases/latest/download/firmware.bin";
 const char* MACHINE_EVENT_URL = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-machine-event";
 const char* INJECTION_DEVICE_ID = "ec089dbd-7269-4c1d-86b8-e425400f80bf";  // machine 7 (board 7): injection monitor
+const char* MACHINE6_DEVICE_ID  = "03100ff2-811b-47af-ba77-fe204ec1f9e6";  // machine 6 (board 6): injection monitor
 
 Preferences prefs;
 int boardNum = BOARD_NUM;
@@ -56,7 +57,7 @@ bool everSawTag = false;                // read a tag at least once THIS boot (g
 // never drift relative to its GPIO. GPIO 5 (terminal 112) is a wired spare, deliberately not listed.
 bool injectionArmed = false;
 struct MachineSignal { byte pin; const char* name; bool isInjection; };  // isInjection drives the shot counter
-MachineSignal machineSignals[] = {
+MachineSignal machine7Signals[] = {
   {  4, "injection",        true  },   // raw_levels pos 1 - terminal 105
   {  6, "mould_opening",    false },   // raw_levels pos 2 - terminal 109  (confirmed working)
   {  7, "ejecting_forward", false },   // raw_levels pos 3 - terminal 110
@@ -65,10 +66,27 @@ MachineSignal machineSignals[] = {
   { 40, "carriage_back",    false },   // raw_levels pos 6 - terminal 108
   { 41, "ejecting_back",    false },   // raw_levels pos 7 - terminal 111
 };
-const int NUM_SIGNALS = sizeof(machineSignals) / sizeof(machineSignals[0]);
-volatile bool          sigState[7];                 // current debounced state per channel (true = active = LOW)
-volatile bool          sigChanged[7];               // edge occurred -> loop posts and clears
-volatile unsigned long sigLastEdgeUs[7];            // last accepted edge time (us) for per-channel debounce
+// Machine 6 (Yizumi UN200A5S, board 6), wired 15 Oct 2026. Its Y-outputs SINK: 24 V at idle, 0 V when
+// active; opto + = signal wire, opto - = 0 V (202), so the opto LED is ON at idle and the GPIO reads
+// HIGH when the function is ACTIVE (opposite of machine 7) -> machine6ActiveHigh = true.
+MachineSignal machine6Signals[] = {
+  {  4, "injection",        true  },   // blue   - terminal 118 (Y18 inject conversion, one pulse per shot)
+  {  5, "alarm",            false },   // purple - terminal 127 (Y27 alarm)
+  {  6, "mould_opening",    false },   // grey   - terminal 109
+  {  7, "ejecting_forward", false },   // white  - terminal 110
+  { 15, "carriage_forward", false },   // black  - terminal 104
+  { 16, "charge",           false },   // brown  - terminal 106
+  { 40, "carriage_back",    false },   // orange - terminal 108
+  { 41, "ejecting_back",    false },   // red    - terminal 111
+};
+MachineSignal* machineSignals = machine7Signals;     // chosen at boot by board identity
+int  NUM_SIGNALS   = sizeof(machine7Signals) / sizeof(machine7Signals[0]);
+bool sigActiveHigh = false;                          // false = LOW is active (machine 7); true = HIGH is active (machine 6)
+const char* machineLabel = "machine 7";
+#define MAX_SIGNALS 8
+volatile bool          sigState[MAX_SIGNALS];       // current debounced state per channel (true = active)
+volatile bool          sigChanged[MAX_SIGNALS];     // edge occurred -> loop posts and clears
+volatile unsigned long sigLastEdgeUs[MAX_SIGNALS];  // last accepted edge time (us) for per-channel debounce
 volatile unsigned long injectionShotCount = 0;      // shots (injection idle->active edges), persisted to NVS
 unsigned long          lastShotSaved = 0;           // last shot value written to NVS (throttle flash writes)
 const unsigned long INJECTION_DEBOUNCE_US = 40000;  // 40 ms debounce per channel
@@ -779,7 +797,7 @@ void IRAM_ATTR machineSignalISR(void* arg) {
   unsigned long now = micros();
   if (now - sigLastEdgeUs[i] < INJECTION_DEBOUNCE_US) return;     // debounce contact bounce
   sigLastEdgeUs[i] = now;
-  bool active = (digitalRead(machineSignals[i].pin) == LOW);      // ACTIVE-LOW: LOW = active, HIGH = idle
+  bool active = (digitalRead(machineSignals[i].pin) == (sigActiveHigh ? HIGH : LOW));  // per-machine polarity
   if (active != sigState[i]) {
     sigState[i] = active;
     if (active && machineSignals[i].isInjection) injectionShotCount++;  // idle->active edge = one shot
@@ -985,7 +1003,7 @@ void printStatus() {
     String line = "[mach]";
     for (int i = 0; i < NUM_SIGNALS; i++) {
       line += " " + String(machineSignals[i].name) + "(gpio" + String(machineSignals[i].pin) + ")=" +
-              String(digitalRead(machineSignals[i].pin) == LOW ? "ACT" : "idle");  // active-LOW
+              String(digitalRead(machineSignals[i].pin) == (sigActiveHigh ? HIGH : LOW) ? "ACT" : "idle");
     }
     line += "  shots=" + String(injectionShotCount);
     Serial.println(line);
@@ -1266,29 +1284,37 @@ void setup() {
   // unconnected input rests HIGH (no false events), a real signal sinks it LOW = active. Edge-triggered
   // so an edge is caught even while the loop is busy in a blocking HTTP post. Arm by BOARD NUMBER *or*
   // device id so a device-id that doesn't match identities.txt can't leave monitoring silently dormant.
-  if (boardNum == 7 || deviceId == INJECTION_DEVICE_ID) {
+  bool isM7 = (boardNum == 7 || deviceId == INJECTION_DEVICE_ID);
+  bool isM6 = (boardNum == 6 || deviceId == MACHINE6_DEVICE_ID);
+  if (isM6 && !isM7) {
+    machineSignals = machine6Signals;
+    NUM_SIGNALS    = sizeof(machine6Signals) / sizeof(machine6Signals[0]);
+    sigActiveHigh  = true;
+    machineLabel   = "machine 6";
+  }
+  if (isM7 || isM6) {
     // Restore the persisted shot count so a reboot doesn't reset it.
     prefs.begin("machine", true);
     injectionShotCount = prefs.getULong("shots", 0);
     prefs.end();
     lastShotSaved = injectionShotCount;
     // Startup self-test: print the GPIO map only. It does NOT post events or touch the shot count.
-    Serial.println("[mach] GPIO MAP (machine 7)  pos  signal            gpio  active-level");
+    Serial.println("[mach] GPIO MAP (" + String(machineLabel) + ")  pos  signal            gpio  active-level");
     for (int i = 0; i < NUM_SIGNALS; i++) {
       pinMode(machineSignals[i].pin, INPUT_PULLUP);
-      sigState[i]      = (digitalRead(machineSignals[i].pin) == LOW);   // seed with the live level (LOW=active)
+      sigState[i]      = (digitalRead(machineSignals[i].pin) == (sigActiveHigh ? HIGH : LOW));   // seed with the live level
       sigChanged[i]    = false;
       sigLastEdgeUs[i] = 0;
       attachInterruptArg(digitalPinToInterrupt(machineSignals[i].pin),
                          machineSignalISR, (void*)(intptr_t)i, CHANGE);
       Serial.println("   [mach]   " + String(i + 1) + "   " + machineSignals[i].name +
-                     "  gpio" + String(machineSignals[i].pin) + "  LOW(active)  now=" +
-                     String(digitalRead(machineSignals[i].pin) == LOW ? "ACTIVE" : "idle"));
+                     "  gpio" + String(machineSignals[i].pin) + (sigActiveHigh ? "  HIGH(active)  now=" : "  LOW(active)  now=") +
+                     String(digitalRead(machineSignals[i].pin) == (sigActiveHigh ? HIGH : LOW) ? "ACTIVE" : "idle"));
     }
     injectionArmed = true;
-    Serial.println("[mach] ARMED " + String(NUM_SIGNALS) + " active-low inputs, shots restored=" + String(injectionShotCount));
+    Serial.println("[mach] ARMED " + String(machineLabel) + " " + String(NUM_SIGNALS) + (sigActiveHigh ? " active-high" : " active-low") + " inputs, shots restored=" + String(injectionShotCount));
   } else {
-    Serial.println("[mach] NOT armed - board #" + String(boardNum) + " is not machine 7 (dormant)");
+    Serial.println("[mach] NOT armed - board #" + String(boardNum) + " is not a monitored machine (dormant)");
   }
 
   Serial.println("========================================");
@@ -1371,7 +1397,7 @@ void loop() {
       sigChanged[i] = false;
       interrupts();
       Serial.println("[edge] " + String(machineSignals[i].name) + " gpio" + String(machineSignals[i].pin) +
-                     " -> " + String(active ? "ACTIVE(LOW)" : "idle(HIGH)") + " t=" + String(millis()));
+                     " -> " + String(active ? "ACTIVE" : "idle") + " t=" + String(millis()));
       postMachineSignal(machineSignals[i].name, active, shots);
       if (machineSignals[i].isInjection) saveShotCount();
     }
@@ -1382,7 +1408,7 @@ void loop() {
     lastRawPrintAt = now;
     String lv = "";
     for (int i = 0; i < NUM_SIGNALS; i++) lv += (digitalRead(machineSignals[i].pin) == HIGH) ? "H" : "L";
-    Serial.println("RAW " + lv + "  (inj,mould,ejF,carF,charge,carB,ejB)");
+    Serial.println("RAW " + lv);
   }
 
   // Raw pin-level snapshot to the backend (machine 7): every LEVEL_SNAP_INTERVAL post the ACTUAL HIGH/
