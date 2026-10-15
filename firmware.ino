@@ -16,7 +16,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.1.1"
+#define FW_VERSION "1.1.2"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -69,9 +69,9 @@ MachineSignal machine7Signals[] = {
 // Machine 6 (Yizumi UN200A5S, board 6), wired 15 Oct 2026. Its Y-outputs SINK: 24 V at idle, 0 V when
 // active; opto + = signal wire, opto - = 0 V (202), so the opto LED is ON at idle and the GPIO reads
 // HIGH when the function is ACTIVE (opposite of machine 7) -> machine6ActiveHigh = true.
+// NO alarm (127): the opto's leakage through the alarm buzzer/lamp kept the alarm on. Never tap 127 this way.
 MachineSignal machine6Signals[] = {
   {  4, "injection",        true  },   // blue   - terminal 118 (Y18 inject conversion, one pulse per shot)
-  {  5, "alarm",            false },   // purple - terminal 127 (Y27 alarm)
   {  6, "mould_opening",    false },   // grey   - terminal 109
   {  7, "ejecting_forward", false },   // white  - terminal 110
   { 15, "carriage_forward", false },   // black  - terminal 104
