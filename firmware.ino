@@ -17,7 +17,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.2.0"
+#define FW_VERSION "1.2.1"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -786,11 +786,18 @@ void sendHeartbeat() {
   long otaAgeS = (long)((millis() - lastOtaAt) / 1000);
   long otaInS  = otaInProgress ? 0 : ((long)(OTA_CHECK_INTERVAL / 1000) - otaAgeS);
   if (otaInS < 0) otaInS = 0;
+  // reader_ok = is the CHIP ANSWERING, not "is it fully re-configured". A real version byte (anything but
+  // 0x00/0xFF, which mean genuinely dead/absent SPI) OR a tag currently held proves the reader is alive and
+  // talking. This is deliberately decoupled from the internal rc522Ok gate: rc522Ok also requires the antenna
+  // config to have "stuck" and flaps false during a self-heal re-init, which on a busy machine board made the
+  // heartbeat report reader_ok=false even while the reader answered 0x92 and read tags (the 1.2.0 regression).
+  // A genuinely dead reader still reads 0x00/0xFF -> reader_ok false, so the real SPI-dead alarm is preserved.
+  bool readerAnswering = (lastReaderVersion != 0x00 && lastReaderVersion != 0xFF) || currentUID != "";
   String body = String("{\"firmware_version\":\"") + FW_VERSION +
                 "\",\"ip\":\"" + ip +
                 "\",\"rssi\":" + String(rssi) +
                 ",\"board_code\":\"" + boardCode + "\"" +
-                ",\"reader_ok\":" + (rc522Ok ? "true" : "false") +           // reader detected & configured
+                ",\"reader_ok\":" + (readerAnswering ? "true" : "false") +   // chip answering (real ver) or tag held
                 ",\"reader_ver\":\"0x" + String(lastReaderVersion, HEX) + "\"" +  // RC522 version byte
                 ",\"tag\":\"" + currentUID + "\"" +                          // UID currently held ("" = none)
                 ",\"ota_in_s\":" + String(otaInS) +                          // seconds to next OTA check (0 = in progress)
