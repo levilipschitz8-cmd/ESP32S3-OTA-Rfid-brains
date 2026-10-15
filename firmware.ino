@@ -6,6 +6,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPUpdate.h>
 #include <Preferences.h>
+#include <time.h>
 
 // ====== IDENTITY ======
 // OTA / generic build: leave these BLANK so each board keeps the identity
@@ -16,7 +17,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.1.2"
+#define FW_VERSION "1.2.0"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -87,9 +88,29 @@ const char* machineLabel = "machine 7";
 volatile bool          sigState[MAX_SIGNALS];       // current debounced state per channel (true = active)
 volatile bool          sigChanged[MAX_SIGNALS];     // edge occurred -> loop posts and clears
 volatile unsigned long sigLastEdgeUs[MAX_SIGNALS];  // last accepted edge time (us) for per-channel debounce
+volatile unsigned long sigEdgeMs[MAX_SIGNALS];      // millis() captured IN THE ISR at each accepted edge (for device_ts)
 volatile unsigned long injectionShotCount = 0;      // shots (injection idle->active edges), persisted to NVS
 unsigned long          lastShotSaved = 0;           // last shot value written to NVS (throttle flash writes)
 const unsigned long INJECTION_DEBOUNCE_US = 40000;  // 40 ms debounce per channel
+// ---- NTP real-time + boot-anchor (accurate per-event timestamps) ----
+bool          timeSynced   = false;                 // true once NTP has given us a real UTC epoch
+uint64_t      bootEpochMs  = 0;                      // epoch(ms) at board boot = synced_epoch_ms - millis()
+unsigned long lastNtpCheck = 0;                      // last poll for a valid NTP epoch
+unsigned long lastNtpResync = 0;                     // last re-trigger of SNTP
+unsigned long machineSeq   = 0;                      // monotonic per-boot event sequence (order is provable)
+const unsigned long NTP_CHECK_INTERVAL  = 5000;      // poll for a valid NTP time this often (non-blocking)
+const unsigned long NTP_RESYNC_INTERVAL = 3UL * 3600UL * 1000UL;   // re-sync SNTP every 3 hours
+// ---- Machine-event RAM ring buffer (offline buffering; survives WiFi outages) ----
+struct MachineEvt {
+  char          signal[24];
+  bool          active;
+  unsigned long shots;
+  unsigned long uptimeMs;    // millis() at the edge -> device_ts = bootEpochMs + uptimeMs
+  unsigned long seq;
+};
+const int      EVT_BUF_N = 300;                      // hold ~300 events across an outage
+MachineEvt     evtBuf[EVT_BUF_N];
+int            evtHead = 0, evtCount = 0;            // FIFO ring (oldest at evtHead)
 String currentUID = "";
 byte lastReaderVersion = 0;             // last RC522 version byte read (for the status line)
 unsigned long lastSeenAt = 0;
@@ -801,6 +822,7 @@ void IRAM_ATTR machineSignalISR(void* arg) {
   if (active != sigState[i]) {
     sigState[i] = active;
     if (active && machineSignals[i].isInjection) injectionShotCount++;  // idle->active edge = one shot
+    sigEdgeMs[i] = millis();                                            // real uptime AT the edge (for device_ts)
     sigChanged[i] = true;
   }
 }
@@ -808,6 +830,85 @@ void IRAM_ATTR machineSignalISR(void* arg) {
 // POST one machine signal state change to Supabase (machine 7). Reuses the SAME X-Device-Id/
 // X-Device-Key auth as the heartbeat. Server stamps the time (created_at); we send which signal,
 // its new state, the running shot count and uptime.
+// ISO 8601 UTC with milliseconds from an epoch-ms value.
+String isoFromEpochMs(uint64_t epochMs) {
+  time_t s = (time_t)(epochMs / 1000ULL);
+  int ms = (int)(epochMs % 1000ULL);
+  struct tm tmv;
+  gmtime_r(&s, &tmv);
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+           tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+           tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ms);
+  return String(buf);
+}
+
+// device_ts for an event captured at edge uptime `uptimeMs`: boot_epoch + uptime (boot-anchored, so an
+// event captured BEFORE the clock was set still gets an accurate time once NTP syncs). "" until synced.
+String deviceTsFor(unsigned long uptimeMs) {
+  if (!timeSynced) return "";
+  return isoFromEpochMs(bootEpochMs + (uint64_t)uptimeMs);
+}
+
+// Non-blocking NTP: detect the first valid time and set the boot anchor; re-sync every few hours. configTime
+// kicks off SNTP in the background - this only polls time(nullptr), so it never blocks the main loop.
+void ntpService() {
+  unsigned long nowMs = millis();
+  if (nowMs - lastNtpCheck >= NTP_CHECK_INTERVAL) {
+    lastNtpCheck = nowMs;
+    time_t s = time(nullptr);
+    if (s > 1700000000) {                                             // a real epoch (after 2023) -> clock is set
+      bootEpochMs = (uint64_t)s * 1000ULL - (uint64_t)millis();       // re-anchor each check = drift-corrected
+      if (!timeSynced) { timeSynced = true; Serial.println("[ntp] synced; boot_epoch anchored"); }
+    }
+  }
+  if (nowMs - lastNtpResync >= NTP_RESYNC_INTERVAL) {
+    lastNtpResync = nowMs;
+    configTime(0, 0, "pool.ntp.org", "time.google.com");              // re-trigger SNTP (UTC)
+  }
+}
+
+// Append an edge event to the ring buffer (drops the OLDEST if full - keeps the most recent ~300).
+void enqueueMachineEvt(const char* name, bool active, unsigned long shots, unsigned long uptimeMs) {
+  int idx = (evtHead + evtCount) % EVT_BUF_N;
+  strncpy(evtBuf[idx].signal, name, sizeof(evtBuf[idx].signal) - 1);
+  evtBuf[idx].signal[sizeof(evtBuf[idx].signal) - 1] = '\0';
+  evtBuf[idx].active   = active;
+  evtBuf[idx].shots    = shots;
+  evtBuf[idx].uptimeMs = uptimeMs;
+  evtBuf[idx].seq      = ++machineSeq;
+  if (evtCount < EVT_BUF_N) evtCount++;
+  else evtHead = (evtHead + 1) % EVT_BUF_N;                           // full -> overwrite oldest
+}
+
+// POST one buffered event with its OWN device_ts (+ uptime_ms + seq). Returns true on 2xx.
+bool postOneMachineEvt(const MachineEvt& e) {
+  String ts = deviceTsFor(e.uptimeMs);
+  String resp;
+  String body = String("{\"signal\":\"") + e.signal +
+                "\",\"state\":\"" + (e.active ? "active" : "idle") +
+                "\",\"shot_count\":" + String(e.shots) +
+                ",\"uptime_ms\":" + String(e.uptimeMs) +
+                ",\"seq\":" + String(e.seq) +
+                ",\"device_ts\":\"" + ts + "\"}";
+  int code = postJson(MACHINE_EVENT_URL, body, resp);
+  return (code >= 200 && code < 300);
+}
+
+// Flush the queue IN ORDER. Only sends once the clock is set, so every event carries an accurate
+// boot-anchored device_ts (pre-sync events wait and are backfilled). Stops on the first failure so order
+// is preserved and events are never collapsed to one arrival time.
+void flushMachineEvents() {
+  if (WiFi.status() != WL_CONNECTED) return;                         // offline -> keep buffering
+  if (!timeSynced) return;                                           // no accurate time yet -> hold for backfill
+  int guard = 0;
+  while (evtCount > 0 && guard++ < EVT_BUF_N) {
+    if (!postOneMachineEvt(evtBuf[evtHead])) break;                  // POST failed -> retry later, keep order
+    evtHead = (evtHead + 1) % EVT_BUF_N;
+    evtCount--;
+  }
+}
+
 void postMachineSignal(const char* name, bool active, unsigned long shots) {
   String resp;
   String body = String("{\"signal\":\"") + name +
@@ -1272,6 +1373,11 @@ void setup() {
     Serial.println("WiFi not up yet - will keep retrying");
   }
 
+  // Start SNTP (UTC) in the background. Non-blocking: ntpService() in loop() detects the first valid time
+  // and sets the boot anchor; events captured before then are buffered and backfilled.
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+  lastNtpResync = millis();
+
   if (deviceId != "" && deviceKey != "")
     Serial.println("[id] board=" + String(boardNum) + " code=" + boardCode + " id=" + deviceId + " keyLen=" + String(deviceKey.length()));
   else
@@ -1305,6 +1411,7 @@ void setup() {
       sigState[i]      = (digitalRead(machineSignals[i].pin) == (sigActiveHigh ? HIGH : LOW));   // seed with the live level
       sigChanged[i]    = false;
       sigLastEdgeUs[i] = 0;
+      sigEdgeMs[i]     = 0;
       attachInterruptArg(digitalPinToInterrupt(machineSignals[i].pin),
                          machineSignalISR, (void*)(intptr_t)i, CHANGE);
       Serial.println("   [mach]   " + String(i + 1) + "   " + machineSignals[i].name +
@@ -1361,6 +1468,8 @@ void loop() {
     }
   }
 
+  ntpService();                       // non-blocking: set/maintain the real UTC clock + boot anchor
+
   if (now - lastHeartbeatAt >= HEARTBEAT_INTERVAL) {
     lastHeartbeatAt = now;
     sendHeartbeat();
@@ -1394,13 +1503,15 @@ void loop() {
       noInterrupts();
       bool active = sigState[i];
       unsigned long shots = injectionShotCount;
+      unsigned long edgeMs = sigEdgeMs[i];                 // uptime captured AT the edge (ISR)
       sigChanged[i] = false;
       interrupts();
       Serial.println("[edge] " + String(machineSignals[i].name) + " gpio" + String(machineSignals[i].pin) +
-                     " -> " + String(active ? "ACTIVE" : "idle") + " t=" + String(millis()));
-      postMachineSignal(machineSignals[i].name, active, shots);
+                     " -> " + String(active ? "ACTIVE" : "idle") + " t=" + String(edgeMs));
+      enqueueMachineEvt(machineSignals[i].name, active, shots, edgeMs);   // buffer with its own edge time + seq
       if (machineSignals[i].isInjection) saveShotCount();
     }
+    flushMachineEvents();                                  // send queued events in order, each own device_ts
   }
 
   // 1 Hz RAW serial diagnostic (machine 7): the literal level of all 7 pins, once a second, to serial.
