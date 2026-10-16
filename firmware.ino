@@ -17,7 +17,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.2.1"
+#define FW_VERSION "1.3.0"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -1398,14 +1398,20 @@ void setup() {
   // so an edge is caught even while the loop is busy in a blocking HTTP post. Arm by BOARD NUMBER *or*
   // device id so a device-id that doesn't match identities.txt can't leave monitoring silently dormant.
   bool isM7 = (boardNum == 7 || deviceId == INJECTION_DEVICE_ID);
+  // Every other MATERIAL board (machines 1-6, 8) uses the machine-6 wiring standard (same colours/GPIOs,
+  // sinking outputs, active-HIGH). Production boards (11+) and the mixer reader are never armed. An unwired
+  // board just reads all-HIGH with no edges: no events, the dashboard shows it as "not wired yet".
   bool isM6 = (boardNum == 6 || deviceId == MACHINE6_DEVICE_ID);
-  if (isM6 && !isM7) {
+  bool isStd = !isM7 && (isM6 || (boardNum >= 1 && boardNum <= 8));
+  static char labelBuf[16];
+  if (isStd) {
     machineSignals = machine6Signals;
     NUM_SIGNALS    = sizeof(machine6Signals) / sizeof(machine6Signals[0]);
     sigActiveHigh  = true;
-    machineLabel   = "machine 6";
+    snprintf(labelBuf, sizeof(labelBuf), "machine %d", isM6 ? 6 : boardNum);
+    machineLabel   = labelBuf;
   }
-  if (isM7 || isM6) {
+  if (isM7 || isStd) {
     // Restore the persisted shot count so a reboot doesn't reset it.
     prefs.begin("machine", true);
     injectionShotCount = prefs.getULong("shots", 0);
