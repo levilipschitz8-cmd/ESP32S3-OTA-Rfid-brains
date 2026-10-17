@@ -1,3 +1,8 @@
+// Forward-declare structs used in function signatures BEFORE the includes. arduino-cli injects the
+// auto-generated function prototypes (e.g. postOneMachineEvt(const MachineEvt&)) right after the include
+// block - above where these structs are defined - so without this the ESP32 3.x toolchain fails with
+// "'MachineEvt' does not name a type". A forward declaration here is seen before any injected prototype.
+struct MachineEvt;
 #include <SPI.h>
 #include <MFRC522.h>
 #include <WiFi.h>
@@ -17,7 +22,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.3.1"
+#define FW_VERSION "1.3.2"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
