@@ -17,7 +17,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.3.0"
+#define FW_VERSION "1.3.1"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -85,13 +85,23 @@ int  NUM_SIGNALS   = sizeof(machine7Signals) / sizeof(machine7Signals[0]);
 bool sigActiveHigh = false;                          // false = LOW is active (machine 7); true = HIGH is active (machine 6)
 const char* machineLabel = "machine 7";
 #define MAX_SIGNALS 8
-volatile bool          sigState[MAX_SIGNALS];       // current debounced state per channel (true = active)
-volatile bool          sigChanged[MAX_SIGNALS];     // edge occurred -> loop posts and clears
+volatile bool          sigState[MAX_SIGNALS];       // current debounced electrical state per channel (ISR-owned)
 volatile unsigned long sigLastEdgeUs[MAX_SIGNALS];  // last accepted edge time (us) for per-channel debounce
-volatile unsigned long sigEdgeMs[MAX_SIGNALS];      // millis() captured IN THE ISR at each accepted edge (for device_ts)
 volatile unsigned long injectionShotCount = 0;      // shots (injection idle->active edges), persisted to NVS
 unsigned long          lastShotSaved = 0;           // last shot value written to NVS (throttle flash writes)
-const unsigned long INJECTION_DEBOUNCE_US = 40000;  // 40 ms debounce per channel
+// 15 ms debounce: long enough to kill contact bounce, short enough that a real ~30 ms ejector pulse keeps
+// BOTH edges. The old 40 ms window swallowed short pulses (the ON got filtered, only the OFF survived).
+const unsigned long SIG_DEBOUNCE_US = 15000;
+// ---- Raw per-edge ring (ISR -> loop). EVERY debounced edge is queued here with its own millis(), so a
+// short ON/OFF pair is never collapsed into a single state read even if the loop is stalled in a blocking
+// POST. This is what guarantees "never drop an edge because the pulse was short".
+struct RawEdge { uint8_t ch; bool active; unsigned long tMs; unsigned long shots; };
+const int        RAW_EDGE_N = 64;                   // ample headroom; the loop drains it every pass
+volatile RawEdge rawEdges[RAW_EDGE_N];
+volatile int     rawHead = 0, rawTail = 0;          // head = next write (ISR), tail = next read (loop)
+// Per-channel loop-side bookkeeping for pulse_ms + missed-ON reconstruction (NOT touched by the ISR).
+unsigned long    sigOnMs[MAX_SIGNALS];              // millis() of the last ON edge seen (for pulse_ms)
+bool             lastSentActive[MAX_SIGNALS];        // was the last event we SENT for this channel "active"?
 // ---- NTP real-time + boot-anchor (accurate per-event timestamps) ----
 bool          timeSynced   = false;                 // true once NTP has given us a real UTC epoch
 uint64_t      bootEpochMs  = 0;                      // epoch(ms) at board boot = synced_epoch_ms - millis()
@@ -106,6 +116,7 @@ struct MachineEvt {
   bool          active;
   unsigned long shots;
   unsigned long uptimeMs;    // millis() at the edge -> device_ts = bootEpochMs + uptimeMs
+  unsigned long pulseMs;     // how long the input was ON (idle events); 0 for active events
   unsigned long seq;
 };
 const int      EVT_BUF_N = 300;                      // hold ~300 events across an outage
@@ -822,16 +833,20 @@ void sendHeartbeat() {
 // clean idle(HIGH)->active(LOW) edge counts exactly one shot (never repeats while it stays LOW).
 void IRAM_ATTR machineSignalISR(void* arg) {
   int i = (int)(intptr_t)arg;
-  unsigned long now = micros();
-  if (now - sigLastEdgeUs[i] < INJECTION_DEBOUNCE_US) return;     // debounce contact bounce
-  sigLastEdgeUs[i] = now;
+  unsigned long nowUs = micros();
+  if (nowUs - sigLastEdgeUs[i] < SIG_DEBOUNCE_US) return;         // debounce contact bounce (15 ms)
+  sigLastEdgeUs[i] = nowUs;
   bool active = (digitalRead(machineSignals[i].pin) == (sigActiveHigh ? HIGH : LOW));  // per-machine polarity
-  if (active != sigState[i]) {
-    sigState[i] = active;
-    if (active && machineSignals[i].isInjection) injectionShotCount++;  // idle->active edge = one shot
-    sigEdgeMs[i] = millis();                                            // real uptime AT the edge (for device_ts)
-    sigChanged[i] = true;
-  }
+  if (active == sigState[i]) return;                             // no real level change -> ignore
+  sigState[i] = active;
+  if (active && machineSignals[i].isInjection) injectionShotCount++;  // idle->active edge = one shot
+  int nxt = (rawHead + 1) % RAW_EDGE_N;
+  if (nxt == rawTail) return;                                    // ring full (loop stalled) -> drop; idle-side reconstruction recovers a missed ON
+  rawEdges[rawHead].ch     = (uint8_t)i;
+  rawEdges[rawHead].active = active;
+  rawEdges[rawHead].tMs    = millis();                           // real uptime AT the edge (for device_ts + pulse_ms)
+  rawEdges[rawHead].shots  = injectionShotCount;
+  rawHead = nxt;
 }
 
 // POST one machine signal state change to Supabase (machine 7). Reuses the SAME X-Device-Id/
@@ -876,13 +891,14 @@ void ntpService() {
 }
 
 // Append an edge event to the ring buffer (drops the OLDEST if full - keeps the most recent ~300).
-void enqueueMachineEvt(const char* name, bool active, unsigned long shots, unsigned long uptimeMs) {
+void enqueueMachineEvt(const char* name, bool active, unsigned long shots, unsigned long uptimeMs, unsigned long pulseMs) {
   int idx = (evtHead + evtCount) % EVT_BUF_N;
   strncpy(evtBuf[idx].signal, name, sizeof(evtBuf[idx].signal) - 1);
   evtBuf[idx].signal[sizeof(evtBuf[idx].signal) - 1] = '\0';
   evtBuf[idx].active   = active;
   evtBuf[idx].shots    = shots;
   evtBuf[idx].uptimeMs = uptimeMs;
+  evtBuf[idx].pulseMs  = pulseMs;
   evtBuf[idx].seq      = ++machineSeq;
   if (evtCount < EVT_BUF_N) evtCount++;
   else evtHead = (evtHead + 1) % EVT_BUF_N;                           // full -> overwrite oldest
@@ -896,6 +912,7 @@ bool postOneMachineEvt(const MachineEvt& e) {
                 "\",\"state\":\"" + (e.active ? "active" : "idle") +
                 "\",\"shot_count\":" + String(e.shots) +
                 ",\"uptime_ms\":" + String(e.uptimeMs) +
+                ",\"pulse_ms\":" + String(e.pulseMs) +
                 ",\"seq\":" + String(e.seq) +
                 ",\"device_ts\":\"" + ts + "\"}";
   int code = postJson(MACHINE_EVENT_URL, body, resp);
@@ -1421,10 +1438,10 @@ void setup() {
     Serial.println("[mach] GPIO MAP (" + String(machineLabel) + ")  pos  signal            gpio  active-level");
     for (int i = 0; i < NUM_SIGNALS; i++) {
       pinMode(machineSignals[i].pin, INPUT_PULLUP);
-      sigState[i]      = (digitalRead(machineSignals[i].pin) == (sigActiveHigh ? HIGH : LOW));   // seed with the live level
-      sigChanged[i]    = false;
-      sigLastEdgeUs[i] = 0;
-      sigEdgeMs[i]     = 0;
+      sigState[i]       = (digitalRead(machineSignals[i].pin) == (sigActiveHigh ? HIGH : LOW));  // seed with the live level
+      sigLastEdgeUs[i]  = 0;
+      sigOnMs[i]        = 0;
+      lastSentActive[i] = sigState[i];   // boots ACTIVE -> treat as already-sent so the first OFF isn't "recovered"
       attachInterruptArg(digitalPinToInterrupt(machineSignals[i].pin),
                          machineSignalISR, (void*)(intptr_t)i, CHANGE);
       Serial.println("   [mach]   " + String(i + 1) + "   " + machineSignals[i].name +
@@ -1508,21 +1525,40 @@ void loop() {
     printStatus();
   }
 
-  // Machine signal changes (machine 7 only): each channel's ISR flags it; post each promptly and
-  // persist the shot count. The ISR captured the edge even if this post blocks, so none are lost.
+  // Machine signal changes: the ISR queued EVERY debounced edge (ON and OFF) into rawEdges with its own
+  // millis(), so short ejector pulses keep BOTH edges even across a blocking POST. Drain in order: emit an
+  // "active" on each ON edge; on each OFF edge emit "idle" carrying pulse_ms = (off - on). If an OFF arrives
+  // while the last SENT state for that channel was already idle (a missed ON: ring overflow or sub-debounce
+  // pulse), reconstruct the "active" first from the recorded ON time, so active/idle counts always balance.
   if (injectionArmed) {
-    for (int i = 0; i < NUM_SIGNALS; i++) {
-      if (!sigChanged[i]) continue;
+    while (rawTail != rawHead) {
       noInterrupts();
-      bool active = sigState[i];
-      unsigned long shots = injectionShotCount;
-      unsigned long edgeMs = sigEdgeMs[i];                 // uptime captured AT the edge (ISR)
-      sigChanged[i] = false;
+      RawEdge e;
+      e.ch     = rawEdges[rawTail].ch;
+      e.active = rawEdges[rawTail].active;
+      e.tMs    = rawEdges[rawTail].tMs;
+      e.shots  = rawEdges[rawTail].shots;
+      rawTail  = (rawTail + 1) % RAW_EDGE_N;
       interrupts();
-      Serial.println("[edge] " + String(machineSignals[i].name) + " gpio" + String(machineSignals[i].pin) +
-                     " -> " + String(active ? "ACTIVE" : "idle") + " t=" + String(edgeMs));
-      enqueueMachineEvt(machineSignals[i].name, active, shots, edgeMs);   // buffer with its own edge time + seq
-      if (machineSignals[i].isInjection) saveShotCount();
+      const char* name = machineSignals[e.ch].name;
+      if (e.active) {
+        sigOnMs[e.ch] = e.tMs;                             // remember when it went ON (for pulse_ms)
+        enqueueMachineEvt(name, true, e.shots, e.tMs, 0);
+        lastSentActive[e.ch] = true;
+        Serial.println("[edge] " + String(name) + " -> ACTIVE t=" + String(e.tMs));
+      } else {
+        if (!lastSentActive[e.ch]) {                       // missed ON -> send it FIRST so counts balance
+          unsigned long onMs = sigOnMs[e.ch] ? sigOnMs[e.ch] : e.tMs;
+          enqueueMachineEvt(name, true, e.shots, onMs, 0);
+          Serial.println("[edge] " + String(name) + " -> ACTIVE (recovered) t=" + String(onMs));
+        }
+        unsigned long onMs = sigOnMs[e.ch];
+        unsigned long pulseMs = (onMs && e.tMs >= onMs) ? (e.tMs - onMs) : 0;
+        enqueueMachineEvt(name, false, e.shots, e.tMs, pulseMs);
+        lastSentActive[e.ch] = false;
+        Serial.println("[edge] " + String(name) + " -> idle t=" + String(e.tMs) + " pulse=" + String(pulseMs) + "ms");
+      }
+      if (machineSignals[e.ch].isInjection) saveShotCount();
     }
     flushMachineEvents();                                  // send queued events in order, each own device_ts
   }
