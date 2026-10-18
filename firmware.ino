@@ -22,7 +22,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.3.2"
+#define FW_VERSION "1.3.3"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -60,7 +60,9 @@ bool everSawTag = false;                // read a tag at least once THIS boot (g
 // "active" when it reads LOW, "idle" when it reads HIGH. An unconnected/idle input rests HIGH via the
 // pull-up = idle (no false events); a real signal sinks it LOW = active. The seven struct entries are
 // the SINGLE source of truth for BOTH the event path and the raw_levels string, so a signal name can
-// never drift relative to its GPIO. GPIO 5 (terminal 112) is a wired spare, deliberately not listed.
+// never drift relative to its GPIO. GPIO 5 (purple, terminal 112 spare) is now "mould_closing" on every
+// board - added as the LAST entry so raw_levels keeps the first 7 positions. It is held (not reported)
+// until it toggles once, so a board where GPIO 5 isn't wired yet (pin stuck at pull-up) stays silent.
 bool injectionArmed = false;
 struct MachineSignal { byte pin; const char* name; bool isInjection; };  // isInjection drives the shot counter
 MachineSignal machine7Signals[] = {
@@ -71,6 +73,7 @@ MachineSignal machine7Signals[] = {
   { 21, "charge",           false },   // raw_levels pos 5 - terminal 106  (plasticizing / screw recovery); moved off GPIO16
   { 40, "carriage_back",    false },   // raw_levels pos 6 - terminal 108
   { 41, "ejecting_back",    false },   // raw_levels pos 7 - terminal 111
+  {  5, "mould_closing",    false },   // raw_levels pos 8 - GPIO5 purple -> MOULD CLOSE (active-LOW, machine-7 polarity); gated until wired
 };
 // Machine 6 (Yizumi UN200A5S, board 6), wired 15 Oct 2026. Its Y-outputs SINK: 24 V at idle, 0 V when
 // active; opto + = signal wire, opto - = 0 V (202), so the opto LED is ON at idle and the GPIO reads
@@ -84,6 +87,7 @@ MachineSignal machine6Signals[] = {
   { 16, "charge",           false },   // brown  - terminal 106
   { 40, "carriage_back",    false },   // orange - terminal 108
   { 41, "ejecting_back",    false },   // red    - terminal 111
+  {  5, "mould_closing",    false },   // purple - GPIO5 -> MOULD CLOSE (active-HIGH std); gated until wired (raw_levels pos 8)
 };
 MachineSignal* machineSignals = machine7Signals;     // chosen at boot by board identity
 int  NUM_SIGNALS   = sizeof(machine7Signals) / sizeof(machine7Signals[0]);
@@ -107,6 +111,7 @@ volatile int     rawHead = 0, rawTail = 0;          // head = next write (ISR), 
 // Per-channel loop-side bookkeeping for pulse_ms + missed-ON reconstruction (NOT touched by the ISR).
 unsigned long    sigOnMs[MAX_SIGNALS];              // millis() of the last ON edge seen (for pulse_ms)
 bool             lastSentActive[MAX_SIGNALS];        // was the last event we SENT for this channel "active"?
+bool             sigArmed[MAX_SIGNALS];              // mould_closing gate: false until GPIO5 toggles once (an unwired pin sits at pull-up forever -> never report)
 // ---- NTP real-time + boot-anchor (accurate per-event timestamps) ----
 bool          timeSynced   = false;                 // true once NTP has given us a real UTC epoch
 uint64_t      bootEpochMs  = 0;                      // epoch(ms) at board boot = synced_epoch_ms - millis()
@@ -1447,6 +1452,9 @@ void setup() {
       sigLastEdgeUs[i]  = 0;
       sigOnMs[i]        = 0;
       lastSentActive[i] = sigState[i];   // boots ACTIVE -> treat as already-sent so the first OFF isn't "recovered"
+      // mould_closing starts DISARMED: an unwired GPIO5 rests at the pull-up level forever, so hold its
+      // events until it proves it's wired by toggling once. Every other channel is armed from boot.
+      sigArmed[i]       = (strcmp(machineSignals[i].name, "mould_closing") != 0);
       attachInterruptArg(digitalPinToInterrupt(machineSignals[i].pin),
                          machineSignalISR, (void*)(intptr_t)i, CHANGE);
       Serial.println("   [mach]   " + String(i + 1) + "   " + machineSignals[i].name +
@@ -1546,6 +1554,13 @@ void loop() {
       rawTail  = (rawTail + 1) % RAW_EDGE_N;
       interrupts();
       const char* name = machineSignals[e.ch].name;
+      if (!sigArmed[e.ch]) {                               // mould_closing: not proven wired yet
+        sigArmed[e.ch]       = true;                       // first real toggle proves it's wired -> arm from here
+        lastSentActive[e.ch] = e.active;                   // adopt this edge as the baseline (do NOT post it)
+        if (e.active) sigOnMs[e.ch] = e.tMs;
+        Serial.println("[edge] " + String(name) + " ARMED (first toggle, not posted) t=" + String(e.tMs));
+        continue;                                          // start posting from the NEXT edge
+      }
       if (e.active) {
         sigOnMs[e.ch] = e.tMs;                             // remember when it went ON (for pulse_ms)
         enqueueMachineEvt(name, true, e.shots, e.tMs, 0);
@@ -1578,7 +1593,8 @@ void loop() {
 
   // Raw pin-level snapshot to the backend (machine 7): every LEVEL_SNAP_INTERVAL post the ACTUAL HIGH/
   // LOW level of all 7 pins straight from digitalRead - bypassing the interrupt/edge path entirely.
-  // One row: signal="raw_levels", state = 7 chars (H/L) in machineSignals order. If a char flips while
+  // One row: signal="raw_levels", state = 8 chars (H/L) in machineSignals order (8th = mould_closing/GPIO5,
+  // appended last; first 7 positions unchanged). If a char flips while
   // the machine cycles but no active/idle event fires -> detection bug; if a char never flips while its
   // function cycles -> that pin is electrically static (tap point / wiring). Ground truth on the tablet.
   if (injectionArmed && now - lastLevelSnapAt >= LEVEL_SNAP_INTERVAL) {
