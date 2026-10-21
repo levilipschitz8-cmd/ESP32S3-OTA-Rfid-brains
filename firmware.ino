@@ -931,7 +931,7 @@ int postJsonRpc(const char* url, const String& body, String& respOut) {
   if (WiFi.status() != WL_CONNECTED) return -1;
   WiFiClientSecure client; client.setInsecure();
   HTTPClient http;
-  http.setConnectTimeout(5000); http.setTimeout(12000);   // slow China->EU link needs headroom on the response read
+  http.setConnectTimeout(5000); http.setTimeout(12000);   // the RPC reply has one acked entry per event (~7KB for a full batch); give the ESP32 time to read it
   if (!http.begin(client, url)) return -2;
   http.addHeader("Content-Type", "application/json");
   http.addHeader("apikey", SUPABASE_ANON_KEY);
@@ -947,7 +947,7 @@ int postJsonRpc(const char* url, const String& body, String& respOut) {
 // boot-anchored) + pulse_ms. Returns how many were durably stored (ok:true) so the caller can drop them;
 // dedup by seq server-side makes a resend always safe. 0 = nothing sent / failed (events kept).
 int postEventsBatch() {
-  int n = evtCount; if (n > 40) n = 40;                   // small batch -> small response the slow link can read back
+  int n = evtCount; if (n > 40) n = 40;                   // keep the batch small so the acked reply stays small enough to read back on the ESP32
   if (n <= 0) return 0;
   String events; events.reserve(12288);
   int idx = evtHead;
@@ -970,10 +970,12 @@ int postEventsBatch() {
                 "\",\"_events\":[" + events + "],\"_status\":" + status + "}";
   String resp;
   int code = postJsonRpc(EVENTS_RPC_URL, body, resp);
-  // A 2xx means the RPC actually ran (it is SECURITY DEFINER and dedups by seq, so a resend is always safe).
-  // Treat 2xx as durable UNLESS the body we managed to read explicitly says ok:false (e.g. bad device creds).
-  // We must NOT require reading "ok":true: the response carries a large "acked" array and the slow link often
-  // can't return it inside the timeout, leaving resp empty -- that was the 1.5.0 bug where the buffer never drained.
+  // A 2xx means the RPC actually ran (it is SECURITY DEFINER and dedups by (device_id, seq), so a resend is
+  // always safe and never doubles data). Treat 2xx as durable for the WHOLE batch we sent UNLESS the body we
+  // managed to read explicitly says ok:false (e.g. bad device creds). We must NOT require reading "ok":true,
+  // and must NOT depend on the acked list: the reply has one acked entry per event (~7KB for a full batch),
+  // which the ESP32 often can't read back inside the timeout, leaving resp empty -- that was the 1.5.0 bug
+  // where ok read false and the buffer never drained even though the server had stored everything.
   bool okFalse = (resp.indexOf("\"ok\":false") >= 0);
   bool ok = (code >= 200 && code < 300) && !okFalse;
   if (!ok) Serial.println("[rpc] batch code=" + String(code) + " resp=" + resp.substring(0, 80));
