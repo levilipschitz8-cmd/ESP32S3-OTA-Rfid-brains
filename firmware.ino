@@ -16,6 +16,7 @@ struct Evt;   // forward-declared before the includes so arduino-cli's injected 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 
 // ====== IDENTITY ======
 // OTA / generic build: leave these BLANK so each board keeps the identity
@@ -26,7 +27,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.4.0"
+#define FW_VERSION "1.4.1"
 
 // Batch event ingest (Stage 1): the PI-SHEQsys RPC. Auth = _device_id + _key in the body (validated
 // server-side as sha256(_key)==api_key_hash), but PostgREST still needs the project's PUBLIC anon key in
@@ -163,6 +164,9 @@ uint32_t lastSeqSaved = 0;
 TaskHandle_t captureTaskH = nullptr, senderTaskH = nullptr;
 bool pinmapSent = false;                             // pinmap included in _status once per boot
 bool firstOkPost = false;                            // one ok:true POST happened (OTA validation gate)
+SemaphoreHandle_t httpMux = nullptr;                 // serialize all TLS POSTs (no concurrent mbedtls heap spikes)
+int  bootResetReason = 0;                            // esp_reset_reason() at boot - reported in _status for crash diagnosis
+unsigned long lastShotSaveMs = 0;                    // throttle NVS shot-count writes
 
 // ---- NTP real-time + boot-anchor (accurate per-event timestamps) ----
 bool          timeSynced   = false;
@@ -299,17 +303,19 @@ String uidToString(MFRC522::Uid uid) {
 
 int postJson(const char* url, const String& body, String& respOut) {
   if (WiFi.status() != WL_CONNECTED) return -1;
+  if (httpMux && xSemaphoreTake(httpMux, pdMS_TO_TICKS(12000)) != pdTRUE) return -3;  // couldn't get the TLS lock
   WiFiClientSecure client; client.setInsecure();
   HTTPClient http;
   http.setConnectTimeout(4000);
   http.setTimeout(4000);
-  if (!http.begin(client, url)) return -2;
+  if (!http.begin(client, url)) { if (httpMux) xSemaphoreGive(httpMux); return -2; }
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Device-Id", deviceId);
   http.addHeader("X-Device-Key", deviceKey);
   int code = http.POST(body);
   respOut = http.getString();
   http.end();
+  if (httpMux) xSemaphoreGive(httpMux);
   // ANY successful post (heartbeat, tag event, command result, machine event) counts as server contact.
   // This stops the offline watchdog from rebooting a board that is busy and successfully talking to the
   // server (e.g. processing a queue of writes) just because a plain heartbeat hasn't fired in a while.
@@ -1014,6 +1020,9 @@ String buildStatusJson() {
   for (int i = 0; i < NUM_SIGNALS; i++) if (capLastChangeMs[i] > recentChange) recentChange = capLastChangeMs[i];
   bool othersCycling = (recentChange != 0) && (now - recentChange < 600000UL);
   String s = "{\"last_seq\":" + String(gSeq) + ",\"buffered\":" + String(evtCount) + ",\"fw\":\"" + FW_VERSION + "\"";
+  s += ",\"reset_reason\":" + String(bootResetReason) +            // why the board last rebooted (crash diagnosis)
+       ",\"heap\":" + String((unsigned)esp_get_free_heap_size()) +
+       ",\"heap_min\":" + String((unsigned)esp_get_minimum_free_heap_size());
   s += ",\"counters\":{"; for (int i = 0; i < NUM_SIGNALS; i++) { if (i) s += ","; s += "\"" + String(machineSignals[i].name) + "\":" + String(capCounter[i]); } s += "}";
   s += ",\"noise\":{";    for (int i = 0; i < NUM_SIGNALS; i++) { if (i) s += ","; s += "\"" + String(machineSignals[i].name) + "\":" + String(capNoise[i]); }    s += "}";
   String stuck = "", silent = "";
@@ -1047,9 +1056,10 @@ bool postEventsBatch(int& ackedOut) {
   int sent = 0;
   if (timeSynced) {                                                  // hold events until the clock is real
     portENTER_CRITICAL(&evtMux);
-    int n = evtCount; if (n > 500) n = 500;
+    int n = evtCount; if (n > 120) n = 120;            // smaller batches = smaller Strings = less heap pressure
     int idx = evtHead;
     portEXIT_CRITICAL(&evtMux);
+    events.reserve(14336);
     for (int k = 0; k < n; k++) {
       Evt ev = evtRing[idx];
       idx = (idx + 1) % EVT_CAP;
@@ -1065,18 +1075,21 @@ bool postEventsBatch(int& ackedOut) {
       sent++;
     }
   }
-  String body = String("{\"_device_id\":\"") + deviceId + "\",\"_key\":\"" + deviceKey +
-                "\",\"_events\":[" + events + "],\"_status\":" + buildStatusJson() + "}";
+  String body; body.reserve(events.length() + 2048);
+  body = String("{\"_device_id\":\"") + deviceId + "\",\"_key\":\"" + deviceKey +
+         "\",\"_events\":[" + events + "],\"_status\":" + buildStatusJson() + "}";
+  if (httpMux && xSemaphoreTake(httpMux, pdMS_TO_TICKS(12000)) != pdTRUE) return false;  // serialize with heartbeat TLS
   WiFiClientSecure client; client.setInsecure();
   HTTPClient http;
   http.setConnectTimeout(5000); http.setTimeout(8000);
-  if (!http.begin(client, EVENTS_RPC_URL)) return false;
+  if (!http.begin(client, EVENTS_RPC_URL)) { if (httpMux) xSemaphoreGive(httpMux); return false; }
   http.addHeader("Content-Type", "application/json");
   http.addHeader("apikey", SUPABASE_ANON_KEY);
   http.addHeader("Authorization", String("Bearer ") + SUPABASE_ANON_KEY);
   int code = http.POST(body);
   String resp = http.getString();
   http.end();
+  if (httpMux) xSemaphoreGive(httpMux);
   bool ok = (code >= 200 && code < 300) && resp.indexOf("\"ok\":true") >= 0;
   if (ok) { lastGoodContactAt = millis(); firstOkPost = true; pinmapSent = true; ackedOut = sent; }
   else Serial.println("[rpc] POST code=" + String(code) + " ok=0 resp=" + resp.substring(0, 80));
@@ -1598,6 +1611,8 @@ void setup() {
   delay(300);
 
   resolveIdentity();
+  bootResetReason = (int)esp_reset_reason();   // capture WHY we last rebooted before anything can change it
+  httpMux = xSemaphoreCreateMutex();           // all TLS POSTs serialize on this (heartbeat + sender RPC)
   otaValidateInit();                     // start the OTA rollback gate: this image must prove itself in 60 s
 
   WiFi.mode(WIFI_STA);
@@ -1699,8 +1714,8 @@ void setup() {
     // Task watchdog longer than any legit POST (8 s) so it catches true hangs, not slow servers.
     esp_task_wdt_config_t twdt = { .timeout_ms = 30000, .idle_core_mask = 0, .trigger_panic = true };
     esp_task_wdt_reconfigure(&twdt);
-    xTaskCreatePinnedToCore(captureTask, "capture", 4096,  NULL, 10, &captureTaskH, 0);  // core 0
-    xTaskCreatePinnedToCore(senderTask,  "sender",  12288, NULL, 5,  &senderTaskH,  1);  // core 1
+    xTaskCreatePinnedToCore(captureTask, "capture", 6144,  NULL, 10, &captureTaskH, 0);  // core 0
+    xTaskCreatePinnedToCore(senderTask,  "sender",  16384, NULL, 5,  &senderTaskH,  1);  // core 1 (TLS + JSON)
     Serial.println("[mach] ARMED " + String(machineLabel) + " " + String(NUM_SIGNALS) + (sigActiveHigh ? " active-high" : " active-low") + " inputs, shots=" + String(injectionShotCount) + " ring=" + String(EVT_CAP));
   } else {
     Serial.println("[mach] NOT armed - board #" + String(boardNum) + " is not a monitored machine (dormant)");
@@ -1784,6 +1799,6 @@ void loop() {
     prefs.begin("seqs", false); prefs.putUInt("seq", gSeq); prefs.end();
     lastSeqSaved = gSeq;
   }
-  if (injectionArmed) saveShotCount();
+  if (injectionArmed && now - lastShotSaveMs >= 15000) { saveShotCount(); lastShotSaveMs = now; }  // throttle NVS writes
   otaValidateTick();
 }
