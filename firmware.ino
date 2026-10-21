@@ -27,7 +27,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.4.1"
+#define FW_VERSION "1.4.2"
 
 // Batch event ingest (Stage 1): the PI-SHEQsys RPC. Auth = _device_id + _key in the body (validated
 // server-side as sha256(_key)==api_key_hash), but PostgREST still needs the project's PUBLIC anon key in
@@ -158,6 +158,13 @@ unsigned long lastShotSaved = 0;
 RTC_NOINIT_ATTR uint32_t rtcSeq;
 RTC_NOINIT_ATTR uint32_t rtcSeqMagic;
 const uint32_t RTC_SEQ_MAGIC = 0x5EC0FFEE;
+// Boot-stage marker in RTC (survives a crash reboot, not power loss): records how far the LAST boot got
+// before it reset, so a crash is localized even if that boot dies before any task can report. Reported in
+// the early diagnostic post. 1=setup entered, 2=pins armed, 3=tasks created, 4=loop running.
+RTC_NOINIT_ATTR uint32_t rtcStage;
+RTC_NOINIT_ATTR uint32_t rtcStageMagic;
+const uint32_t RTC_STAGE_MAGIC = 0xB007C0DE;
+int prevBootStage = 0;
 volatile uint32_t gSeq = 0;
 uint32_t lastSeqSaved = 0;
 
@@ -1606,12 +1613,37 @@ void pollRfid() {
   }
 }
 
+// Post the previous boot's reset reason + furthest stage + heap to the RPC _status, BEFORE the risky capture
+// /sender tasks start - so a crash under load is always visible on the next boot (reset_reason tells us
+// panic vs task-WDT vs int-WDT vs brownout; prev_stage tells us where it died).
+void earlyDiagPost() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  String body = String("{\"_device_id\":\"") + deviceId + "\",\"_key\":\"" + deviceKey +
+    "\",\"_events\":[],\"_status\":{\"fw\":\"" + FW_VERSION + "\",\"reset_reason\":" + String(bootResetReason) +
+    ",\"prev_stage\":" + String(prevBootStage) + ",\"heap\":" + String((unsigned)esp_get_free_heap_size()) +
+    ",\"boot\":true}}";
+  if (httpMux && xSemaphoreTake(httpMux, pdMS_TO_TICKS(10000)) != pdTRUE) return;
+  WiFiClientSecure client; client.setInsecure();
+  HTTPClient http; http.setConnectTimeout(5000); http.setTimeout(8000);
+  if (http.begin(client, EVENTS_RPC_URL)) {
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("apikey", SUPABASE_ANON_KEY);
+    http.addHeader("Authorization", String("Bearer ") + SUPABASE_ANON_KEY);
+    int code = http.POST(body);
+    http.end();
+    Serial.println("[diag] boot post code=" + String(code) + " reset=" + String(bootResetReason) + " prevStage=" + String(prevBootStage));
+  }
+  if (httpMux) xSemaphoreGive(httpMux);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(300);
 
   resolveIdentity();
   bootResetReason = (int)esp_reset_reason();   // capture WHY we last rebooted before anything can change it
+  prevBootStage = (rtcStageMagic == RTC_STAGE_MAGIC) ? (int)rtcStage : 0;   // how far the last boot got
+  rtcStageMagic = RTC_STAGE_MAGIC; rtcStage = 1;                            // stage 1 = setup entered
   httpMux = xSemaphoreCreateMutex();           // all TLS POSTs serialize on this (heartbeat + sender RPC)
   otaValidateInit();                     // start the OTA rollback gate: this image must prove itself in 60 s
 
@@ -1642,6 +1674,8 @@ void setup() {
   // and sets the boot anchor; events captured before then are buffered and backfilled.
   configTime(0, 0, "pool.ntp.org", "time.google.com");
   lastNtpResync = millis();
+
+  earlyDiagPost();   // report prev reset_reason + stage BEFORE arming the capture/sender tasks (crash-proof)
 
   if (deviceId != "" && deviceKey != "")
     Serial.println("[id] board=" + String(boardNum) + " code=" + boardCode + " id=" + deviceId + " keyLen=" + String(deviceKey.length()));
@@ -1714,8 +1748,10 @@ void setup() {
     // Task watchdog longer than any legit POST (8 s) so it catches true hangs, not slow servers.
     esp_task_wdt_config_t twdt = { .timeout_ms = 30000, .idle_core_mask = 0, .trigger_panic = true };
     esp_task_wdt_reconfigure(&twdt);
+    rtcStage = 2;                                                                         // pins armed + ISRs attached
     xTaskCreatePinnedToCore(captureTask, "capture", 6144,  NULL, 10, &captureTaskH, 0);  // core 0
     xTaskCreatePinnedToCore(senderTask,  "sender",  16384, NULL, 5,  &senderTaskH,  1);  // core 1 (TLS + JSON)
+    rtcStage = 3;                                                                         // tasks created
     Serial.println("[mach] ARMED " + String(machineLabel) + " " + String(NUM_SIGNALS) + (sigActiveHigh ? " active-high" : " active-low") + " inputs, shots=" + String(injectionShotCount) + " ring=" + String(EVT_CAP));
   } else {
     Serial.println("[mach] NOT armed - board #" + String(boardNum) + " is not a monitored machine (dormant)");
@@ -1729,6 +1765,7 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+  rtcStage = 4;                          // loop running = this boot got past setup/tasks cleanly
 
   // Offline watchdog: if the board can't reach the server for OFFLINE_REBOOT_TIMEOUT,
   // it's stuck (wedged WiFi/TCP) -> hard reboot to force a clean reconnect.
