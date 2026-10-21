@@ -14,6 +14,8 @@ struct MachineEvt;
 #include <time.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
+#include <esp_timer.h>
+#include <driver/gpio.h>
 
 // ====== IDENTITY ======
 // OTA / generic build: leave these BLANK so each board keeps the identity
@@ -24,7 +26,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.5.3"
+#define FW_VERSION "1.5.4"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -101,20 +103,32 @@ int  NUM_SIGNALS   = sizeof(machine7Signals) / sizeof(machine7Signals[0]);
 bool sigActiveHigh = false;                          // false = LOW is active (machine 7); true = HIGH is active (machine 6)
 const char* machineLabel = "machine 7";
 #define MAX_SIGNALS 8
-volatile bool          sigState[MAX_SIGNALS];       // current debounced electrical state per channel (ISR-owned)
-volatile unsigned long sigLastEdgeUs[MAX_SIGNALS];  // last accepted edge time (us) for per-channel debounce
+volatile bool          sigState[MAX_SIGNALS];       // current CONFIRMED logical state per channel (sampler-owned)
 volatile unsigned long injectionShotCount = 0;      // shots (injection idle->active edges), persisted to NVS
 unsigned long          lastShotSaved = 0;           // last shot value written to NVS (throttle flash writes)
-// 15 ms debounce: long enough to kill contact bounce, short enough that a real ~30 ms ejector pulse keeps
-// BOTH edges. The old 40 ms window swallowed short pulses (the ON got filtered, only the OFF survived).
-const unsigned long SIG_DEBOUNCE_US = 15000;
-// ---- Raw per-edge ring (ISR -> loop). EVERY debounced edge is queued here with its own millis(), so a
-// short ON/OFF pair is never collapsed into a single state read even if the loop is stalled in a blocking
-// POST. This is what guarantees "never drop an edge because the pulse was short".
+// ---- 1 ms polling sampler (replaces edge interrupts) ----
+// The opto-isolated inputs settle slowly. An edge interrupt did its single digitalRead BEFORE the pin had
+// settled, read the stale level, and armed a 15 ms debounce lockout - so the real settling transition fell
+// inside the lockout and was dropped, and no further interrupt came while the level then held. That lost
+// whole pulses (injection covered only ~11% vs ~29% of raw-level ON time) and caused extra flickers. Instead
+// a 1 ms esp_timer reads every pin; a new level must hold SAMPLE_CONFIRM consecutive samples before it is
+// accepted, and the edge is timestamped at the FIRST sample of the change. A held pulse can no longer be missed.
+const int           SAMPLE_CONFIRM   = 3;           // consecutive 1 ms samples a new level must hold to be real (~3 ms)
+const uint64_t      SAMPLE_PERIOD_US = 1000;        // 1 ms sampling period
+volatile uint8_t       sampCount[MAX_SIGNALS];      // consecutive samples the pin has differed from sigState
+volatile bool          sampCand[MAX_SIGNALS];       // the differing level currently being counted toward confirm
+volatile unsigned long sampFirstMs[MAX_SIGNALS];    // millis() of the first sample of the pending change (= edge time)
+esp_timer_handle_t     sampleTimer = nullptr;
+// ---- Raw per-edge ring (sampler -> loop). Every CONFIRMED edge (ON and OFF) is queued with its own millis(),
+// so a short ON/OFF pair is never collapsed even if the loop is stalled in a blocking POST.
 struct RawEdge { uint8_t ch; bool active; unsigned long tMs; unsigned long shots; };
 const int        RAW_EDGE_N = 1024;                 // big enough to hold every edge through a ~1 s batch POST (no loss)
 volatile RawEdge rawEdges[RAW_EDGE_N];
-volatile int     rawHead = 0, rawTail = 0;          // head = next write (ISR), tail = next read (loop)
+volatile int     rawHead = 0, rawTail = 0;          // head = next write (sampler, esp_timer task), tail = next read (loop)
+volatile uint32_t rawDrops = 0;                     // edges lost to a full ring (surfaced in _status)
+// The sampler runs in the esp_timer task, on the OTHER core from loop(), so noInterrupts() cannot guard the
+// ring (it only masks the current core) - a real spinlock must.
+portMUX_TYPE     edgeMux = portMUX_INITIALIZER_UNLOCKED;
 // Per-channel loop-side bookkeeping for pulse_ms + missed-ON reconstruction (NOT touched by the ISR).
 unsigned long    sigOnMs[MAX_SIGNALS];              // millis() of the last ON edge seen (for pulse_ms)
 bool             lastSentActive[MAX_SIGNALS];        // was the last event we SENT for this channel "active"?
@@ -859,27 +873,43 @@ void sendHeartbeat() {
   if (code == 200) { firstBeat = false; everConnected = true; lastGoodContactAt = millis(); handleCommand(resp); }
 }
 
-// Per-channel edge interrupt (machine 7 only): ACTIVE-LOW, debounced, minimal, in IRAM. The channel
-// index is passed as the ISR arg so all seven signals share one handler. Interrupt (not 10 ms polling)
-// so an edge is still captured even while the loop is stalled in a blocking HTTP post - strictly better
-// than polling, which would miss an edge that falls inside a network call. On the injection channel a
-// clean idle(HIGH)->active(LOW) edge counts exactly one shot (never repeats while it stays LOW).
-void IRAM_ATTR machineSignalISR(void* arg) {
-  int i = (int)(intptr_t)arg;
-  unsigned long nowUs = micros();
-  if (nowUs - sigLastEdgeUs[i] < SIG_DEBOUNCE_US) return;         // debounce contact bounce (15 ms)
-  sigLastEdgeUs[i] = nowUs;
-  bool active = (digitalRead(machineSignals[i].pin) == (sigActiveHigh ? HIGH : LOW));  // per-machine polarity
-  if (active == sigState[i]) return;                             // no real level change -> ignore
-  sigState[i] = active;
-  if (active && machineSignals[i].isInjection) injectionShotCount++;  // idle->active edge = one shot
-  int nxt = (rawHead + 1) % RAW_EDGE_N;
-  if (nxt == rawTail) return;                                    // ring full (loop stalled) -> drop; idle-side reconstruction recovers a missed ON
-  rawEdges[rawHead].ch     = (uint8_t)i;
-  rawEdges[rawHead].active = active;
-  rawEdges[rawHead].tMs    = millis();                           // real uptime AT the edge (for device_ts + pulse_ms)
-  rawEdges[rawHead].shots  = injectionShotCount;
-  rawHead = nxt;
+// 1 ms polling sampler (all machine signals). Runs in the esp_timer task. For each channel it reads the pin
+// with gpio_get_level and resolves it to the logical "active" level by the board's polarity. A level that
+// differs from the confirmed sigState is counted; once it has held SAMPLE_CONFIRM consecutive samples it is
+// accepted as a real edge: sigState is updated, a shot is counted on an injection ON, and a RawEdge is queued
+// stamped at the FIRST sample of the change (sampFirstMs). A difference that reverts before confirming (bounce,
+// or an unsettled opto edge) just resets the counter and is ignored - which is exactly what the old ISR got
+// wrong. The ring is shared with loop() across cores, so every head/tail touch is under edgeMux.
+void machineSampleTimer(void* arg) {
+  unsigned long nowMs = millis();
+  for (int i = 0; i < NUM_SIGNALS; i++) {
+    bool lvl = (gpio_get_level((gpio_num_t)machineSignals[i].pin) == (sigActiveHigh ? 1 : 0));
+    if (lvl == sigState[i]) { sampCount[i] = 0; continue; }       // steady, or a candidate change that reverted
+    if (sampCount[i] == 0 || sampCand[i] != lvl) {                // a new pending change -> start counting
+      sampCand[i]    = lvl;
+      sampFirstMs[i] = nowMs;                                     // first sample of the change = the edge time
+      sampCount[i]   = 1;
+    } else {
+      sampCount[i]++;                                             // same pending level held one more sample
+    }
+    if (sampCount[i] >= SAMPLE_CONFIRM) {                         // held long enough -> a real edge
+      sampCount[i] = 0;
+      sigState[i]  = lvl;
+      portENTER_CRITICAL(&edgeMux);
+      if (lvl && machineSignals[i].isInjection) injectionShotCount++;   // idle->active = one shot
+      int nxt = (rawHead + 1) % RAW_EDGE_N;
+      if (nxt == rawTail) {
+        rawDrops++;                                               // ring full (loop stalled) -> count the drop
+      } else {
+        rawEdges[rawHead].ch     = (uint8_t)i;
+        rawEdges[rawHead].active = lvl;
+        rawEdges[rawHead].tMs    = sampFirstMs[i];                // uptime AT the edge (for device_ts + pulse_ms)
+        rawEdges[rawHead].shots  = injectionShotCount;
+        rawHead = nxt;
+      }
+      portEXIT_CRITICAL(&edgeMux);
+    }
+  }
 }
 
 // POST one machine signal state change to Supabase (machine 7). Reuses the SAME X-Device-Id/
@@ -1003,7 +1033,7 @@ int postEventsBatch() {
               ",\"pulse_ms\":" + String(e.pulseMs) + "}";
   }
   String status = String("{\"last_seq\":") + String(machineSeq) + ",\"buffered\":" + String(evtCount) +
-                  ",\"fw\":\"" + FW_VERSION + "\"}";
+                  ",\"drops\":" + String(rawDrops) + ",\"fw\":\"" + FW_VERSION + "\"}";
   String body = String("{\"_device_id\":\"") + deviceId + "\",\"_key\":\"" + deviceKey +
                 "\",\"_events\":[" + events + "],\"_status\":" + status + "}";
   String resp;
@@ -1083,8 +1113,7 @@ void checkOTA() {
   // A newer, targeted build exists -> download + flash. On success httpUpdate auto-reboots (we won't
   // return); on failure we record why.
   Serial.println("[ota] " + String(FW_VERSION) + " -> " + remoteVer + " ... downloading");
-  if (injectionArmed)                                            // no ISR during flash write
-    for (int i = 0; i < NUM_SIGNALS; i++) detachInterrupt(digitalPinToInterrupt(machineSignals[i].pin));
+  if (injectionArmed && sampleTimer) esp_timer_stop(sampleTimer); // no sampling during flash write
   otaInProgress = true;
   WiFiClientSecure up; up.setInsecure();
   httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
@@ -1595,20 +1624,27 @@ void setup() {
     for (int i = 0; i < NUM_SIGNALS; i++) {
       pinMode(machineSignals[i].pin, INPUT_PULLUP);
       sigState[i]       = (digitalRead(machineSignals[i].pin) == (sigActiveHigh ? HIGH : LOW));  // seed with the live level
-      sigLastEdgeUs[i]  = 0;
+      sampCount[i]      = 0;             // sampler: no pending change yet
       sigOnMs[i]        = 0;
       lastSentActive[i] = sigState[i];   // boots ACTIVE -> treat as already-sent so the first OFF isn't "recovered"
       // mould_closing starts DISARMED: an unwired GPIO5 rests at the pull-up level forever, so hold its
       // events until it proves it's wired by toggling once. Every other channel is armed from boot.
       sigArmed[i]       = (strcmp(machineSignals[i].name, "mould_closing") != 0);
-      attachInterruptArg(digitalPinToInterrupt(machineSignals[i].pin),
-                         machineSignalISR, (void*)(intptr_t)i, CHANGE);
       Serial.println("   [mach]   " + String(i + 1) + "   " + machineSignals[i].name +
                      "  gpio" + String(machineSignals[i].pin) + (sigActiveHigh ? "  HIGH(active)  now=" : "  LOW(active)  now=") +
                      String(digitalRead(machineSignals[i].pin) == (sigActiveHigh ? HIGH : LOW) ? "ACTIVE" : "idle"));
     }
+    // Start the 1 ms polling sampler (replaces the per-pin edge interrupts).
+    esp_timer_create_args_t sampArgs = {};
+    sampArgs.callback              = &machineSampleTimer;
+    sampArgs.arg                   = nullptr;
+    sampArgs.dispatch_method       = ESP_TIMER_TASK;
+    sampArgs.name                  = "machsamp";
+    sampArgs.skip_unhandled_events = true;    // if the task is briefly late, don't queue a backlog
+    if (esp_timer_create(&sampArgs, &sampleTimer) == ESP_OK)
+      esp_timer_start_periodic(sampleTimer, SAMPLE_PERIOD_US);
     injectionArmed = true;
-    Serial.println("[mach] ARMED " + String(machineLabel) + " " + String(NUM_SIGNALS) + (sigActiveHigh ? " active-high" : " active-low") + " inputs, shots restored=" + String(injectionShotCount));
+    Serial.println("[mach] ARMED " + String(machineLabel) + " " + String(NUM_SIGNALS) + (sigActiveHigh ? " active-high" : " active-low") + " inputs @1ms sampler, shots restored=" + String(injectionShotCount));
   } else {
     Serial.println("[mach] NOT armed - board #" + String(boardNum) + " is not a monitored machine (dormant)");
   }
@@ -1702,14 +1738,14 @@ void loop() {
   // pulse), reconstruct the "active" first from the recorded ON time, so active/idle counts always balance.
   if (injectionArmed) {
     while (rawTail != rawHead) {
-      noInterrupts();
+      portENTER_CRITICAL(&edgeMux);     // sampler writes the ring from the other core -> spinlock, not noInterrupts()
       RawEdge e;
       e.ch     = rawEdges[rawTail].ch;
       e.active = rawEdges[rawTail].active;
       e.tMs    = rawEdges[rawTail].tMs;
       e.shots  = rawEdges[rawTail].shots;
       rawTail  = (rawTail + 1) % RAW_EDGE_N;
-      interrupts();
+      portEXIT_CRITICAL(&edgeMux);
       const char* name = machineSignals[e.ch].name;
       if (!sigArmed[e.ch]) {                               // mould_closing: not proven wired yet
         sigArmed[e.ch]       = true;                       // first real toggle proves it's wired -> arm from here
