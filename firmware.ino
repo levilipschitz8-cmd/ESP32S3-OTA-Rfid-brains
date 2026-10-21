@@ -24,7 +24,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.5.2"
+#define FW_VERSION "1.5.3"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -124,10 +124,14 @@ bool          timeSynced   = false;                 // true once NTP has given u
 uint64_t      bootEpochMs  = 0;                      // epoch(ms) at board boot = synced_epoch_ms - millis()
 unsigned long lastNtpCheck = 0;                      // last poll for a valid NTP epoch
 unsigned long lastNtpResync = 0;                     // last re-trigger of SNTP
-unsigned long machineSeq   = 0;                      // monotonic event sequence (restored from RTC across reboots)
-RTC_NOINIT_ATTR uint32_t rtcMachineSeq;              // seq mirror that survives a reboot (not power loss)
-RTC_NOINIT_ATTR uint32_t rtcSeqMagic;
-const uint32_t RTC_SEQ_MAGIC = 0x5EC0FFEE;
+unsigned long machineSeq    = 0;                     // monotonic event sequence, persisted in NVS
+unsigned long machineSeqHWM = 0;                     // seqs reserved in NVS up to here; refill when machineSeq catches up
+const unsigned long SEQ_RESERVE   = 500;             // reserve this many seqs per NVS write (bounds flash wear; at most this many skipped across an unclean reboot)
+const unsigned long SEQ_SEED_BASE = 1000000UL;       // first-ever NVS seed: start high so a fresh counter can't collide with legacy low-numbered rows already stored
+// NOTE: seq lives in NVS (not RTC) on purpose. RTC_NOINIT is wiped whenever the RTC-memory layout shifts - which
+// happens any time variables are added - so an OTA that changed the layout used to reset the seq to 0 and make
+// every new event collide (as a duplicate) with the board's existing rows. NVS is keyed storage: layout-independent
+// and survives reboot and power loss, so the seq now keeps climbing across every firmware upgrade.
 
 // --- OTA self-validation / rollback state (app-level; this Arduino bootloader has no built-in rollback) ---
 RTC_NOINIT_ATTR uint32_t rtcOtaTrialBoots;           // consecutive boots of an unconfirmed build (survives crash-reboot, not power loss)
@@ -919,6 +923,30 @@ void ntpService() {
   }
 }
 
+// Persisted event-seq counter (NVS namespace "mseq"). Reserved in windows so a reboot never reuses a seq and
+// flash is written only once per SEQ_RESERVE events, not per event. seqRestore() runs once at boot; nextSeq()
+// hands out the next value and refills the reservation when it runs out.
+void seqReserveNext() {
+  machineSeqHWM = machineSeq + SEQ_RESERVE;
+  prefs.begin("mseq", false);
+  prefs.putULong("hwm", machineSeqHWM);
+  prefs.end();
+}
+void seqRestore() {
+  prefs.begin("mseq", true);
+  unsigned long hwm = prefs.getULong("hwm", 0);
+  prefs.end();
+  if (hwm == 0) hwm = SEQ_SEED_BASE;   // first ever boot on NVS seq -> start high, above any legacy low seqs
+  machineSeq = hwm;                    // resume AT the last reserved mark so a seq is never reused (may skip <=SEQ_RESERVE)
+  seqReserveNext();                    // reserve the next window right away
+  Serial.println("[seq] restored from NVS, resuming at " + String(machineSeq));
+}
+unsigned long nextSeq() {
+  unsigned long s = ++machineSeq;
+  if (machineSeq >= machineSeqHWM) seqReserveNext();
+  return s;
+}
+
 // Append an edge event to the ring buffer (drops the OLDEST if full - keeps the most recent ~300).
 void enqueueMachineEvt(const char* name, bool active, unsigned long shots, unsigned long uptimeMs, unsigned long pulseMs) {
   int idx = (evtHead + evtCount) % EVT_BUF_N;
@@ -928,8 +956,7 @@ void enqueueMachineEvt(const char* name, bool active, unsigned long shots, unsig
   evtBuf[idx].shots    = shots;
   evtBuf[idx].uptimeMs = uptimeMs;
   evtBuf[idx].pulseMs  = pulseMs;
-  evtBuf[idx].seq      = ++machineSeq;
-  rtcMachineSeq        = (uint32_t)machineSeq;        // survive a reboot
+  evtBuf[idx].seq      = nextSeq();                   // NVS-persisted, monotonic across reboots and upgrades
   if (evtCount < EVT_BUF_N) evtCount++;
   else evtHead = (evtHead + 1) % EVT_BUF_N;                           // full -> overwrite oldest
 }
@@ -1562,9 +1589,7 @@ void setup() {
     injectionShotCount = prefs.getULong("shots", 0);
     prefs.end();
     lastShotSaved = injectionShotCount;
-    // Restore the event seq from RTC so it keeps counting up across a reboot (0 on a cold/power-loss boot).
-    if (rtcSeqMagic == RTC_SEQ_MAGIC) machineSeq = rtcMachineSeq;
-    else { rtcSeqMagic = RTC_SEQ_MAGIC; rtcMachineSeq = 0; machineSeq = 0; }
+    seqRestore();   // resume the NVS-persisted event seq (robust across reboot, power loss and firmware upgrades)
     // Startup self-test: print the GPIO map only. It does NOT post events or touch the shot count.
     Serial.println("[mach] GPIO MAP (" + String(machineLabel) + ")  pos  signal            gpio  active-level");
     for (int i = 0; i < NUM_SIGNALS; i++) {
