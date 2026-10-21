@@ -26,7 +26,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.5.4"
+#define FW_VERSION "1.5.5"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -1113,6 +1113,9 @@ void checkOTA() {
   // A newer, targeted build exists -> download + flash. On success httpUpdate auto-reboots (we won't
   // return); on failure we record why.
   Serial.println("[ota] " + String(FW_VERSION) + " -> " + remoteVer + " ... downloading");
+  // Send everything already captured before the update restarts the board (v1.5.5): events still in the
+  // buffer when the board reboots for an update were lost (M2, 21 Oct 12:12: 33 events).
+  if (injectionArmed) flushMachineEvents();
   if (injectionArmed && sampleTimer) esp_timer_stop(sampleTimer); // no sampling during flash write
   otaInProgress = true;
   WiFiClientSecure up; up.setInsecure();
@@ -1627,9 +1630,10 @@ void setup() {
       sampCount[i]      = 0;             // sampler: no pending change yet
       sigOnMs[i]        = 0;
       lastSentActive[i] = sigState[i];   // boots ACTIVE -> treat as already-sent so the first OFF isn't "recovered"
-      // mould_closing starts DISARMED: an unwired GPIO5 rests at the pull-up level forever, so hold its
-      // events until it proves it's wired by toggling once. Every other channel is armed from boot.
-      sigArmed[i]       = (strcmp(machineSignals[i].name, "mould_closing") != 0);
+      // Every channel is armed from boot (v1.5.5, Levi 21 Oct). The old "hold mould_closing until its first
+      // toggle" gate threw away the first real mould close after every restart. An unwired pin never changes
+      // level, so the sampler never emits anything for it anyway - the gate added nothing.
+      sigArmed[i]       = true;
       Serial.println("   [mach]   " + String(i + 1) + "   " + machineSignals[i].name +
                      "  gpio" + String(machineSignals[i].pin) + (sigActiveHigh ? "  HIGH(active)  now=" : "  LOW(active)  now=") +
                      String(digitalRead(machineSignals[i].pin) == (sigActiveHigh ? HIGH : LOW) ? "ACTIVE" : "idle"));
