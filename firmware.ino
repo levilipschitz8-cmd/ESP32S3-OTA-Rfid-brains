@@ -12,6 +12,8 @@ struct MachineEvt;
 #include <HTTPUpdate.h>
 #include <Preferences.h>
 #include <time.h>
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
 
 // ====== IDENTITY ======
 // OTA / generic build: leave these BLANK so each board keeps the identity
@@ -22,7 +24,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.5.1"
+#define FW_VERSION "1.5.2"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -126,6 +128,15 @@ unsigned long machineSeq   = 0;                      // monotonic event sequence
 RTC_NOINIT_ATTR uint32_t rtcMachineSeq;              // seq mirror that survives a reboot (not power loss)
 RTC_NOINIT_ATTR uint32_t rtcSeqMagic;
 const uint32_t RTC_SEQ_MAGIC = 0x5EC0FFEE;
+
+// --- OTA self-validation / rollback state (app-level; this Arduino bootloader has no built-in rollback) ---
+RTC_NOINIT_ATTR uint32_t rtcOtaTrialBoots;           // consecutive boots of an unconfirmed build (survives crash-reboot, not power loss)
+RTC_NOINIT_ATTR uint32_t rtcOtaMagic;                // own magic so power-loss detection doesn't collide with the seq block
+const uint32_t RTC_OTA_MAGIC = 0xB007C0DE;
+const int      OTA_TRIAL_MAX = 3;                    // after this many unconfirmed reboots -> revert to the previous app
+const unsigned long OTA_CONFIRM_MS           = 60000;   // uptime WITH server contact before a new build is marked good
+const unsigned long OTA_UNCONFIRMED_REBOOT_MS = 600000; // never reached the server in 10 min on a new build -> reboot to advance the trial
+bool fwConfirmed = false;                            // this build has proven itself healthy this session
 const unsigned long NTP_CHECK_INTERVAL  = 5000;      // poll for a valid NTP time this often (non-blocking)
 const unsigned long NTP_RESYNC_INTERVAL = 3UL * 3600UL * 1000UL;   // re-sync SNTP every 3 hours
 // ---- Machine-event RAM ring buffer (offline buffering; survives WiFi outages) ----
@@ -1431,11 +1442,65 @@ void pollRfid() {
   }
 }
 
+// Called once, very early in setup(): decide whether the build now running has earned trust or must be
+// reverted. A build is "on trial" until confirmFirmwareIfHealthy() marks it good in NVS. Every boot that
+// happens before that increments rtcOtaTrialBoots; once it passes OTA_TRIAL_MAX the build is crash-looping
+// (or can't phone home across reboots) so we switch the boot partition back to the previous app. This is the
+// real safety net on an Arduino bootloader that has no built-in rollback: esp_ota_set_boot_partition()
+// validates the target image, so if there is no valid previous app we stay put rather than brick the board.
+void otaRollbackGate() {
+  if (rtcOtaMagic != RTC_OTA_MAGIC) { rtcOtaMagic = RTC_OTA_MAGIC; rtcOtaTrialBoots = 0; }  // cold/power-loss boot
+
+  prefs.begin("ota", true);
+  String okFw = prefs.getString("okfw", "");
+  prefs.end();
+
+  if (okFw == String(FW_VERSION)) {                 // this exact build already proved itself on an earlier boot
+    fwConfirmed = true;
+    rtcOtaTrialBoots = 0;
+    return;
+  }
+
+  rtcOtaTrialBoots++;                               // unconfirmed build -> it is on trial this boot
+  Serial.println("[ota] trial boot " + String(rtcOtaTrialBoots) + "/" + String(OTA_TRIAL_MAX) +
+                 " for FW " + String(FW_VERSION) + " (last good=\"" + okFw + "\")");
+  if (rtcOtaTrialBoots > OTA_TRIAL_MAX) {
+    const esp_partition_t* prev = esp_ota_get_next_update_partition(NULL);   // inactive slot = previous app
+    if (prev && esp_ota_set_boot_partition(prev) == ESP_OK) {
+      rtcOtaTrialBoots = 0;                         // let the previous (known-good) app boot clean
+      Serial.println("[ota] ROLLBACK: FW " + String(FW_VERSION) + " never confirmed - reverting to previous app");
+      delay(100);
+      esp_restart();
+    } else {
+      rtcOtaTrialBoots = 0;                         // no valid previous image -> don't retry the rollback every boot
+      Serial.println("[ota] rollback wanted but no valid previous app - staying on " + String(FW_VERSION));
+    }
+  }
+}
+
+// Called from loop(): once a new build has run OTA_CONFIRM_MS with a live server contact, mark it good so a
+// future reboot won't treat it as on-trial, and disarm the trial counter. esp_ota_mark_app_valid... is a
+// harmless no-op if the bootloader has no rollback, and correct if it ever does.
+void confirmFirmwareIfHealthy() {
+  if (fwConfirmed) return;
+  if (millis() < OTA_CONFIRM_MS) return;            // must survive a sustained window, not just reach the server once
+  if (!everConnected) return;                       // must have actually talked to the server this boot
+  if (millis() - lastGoodContactAt > 30000) return; // and contact must be healthy right now
+  prefs.begin("ota", false);
+  prefs.putString("okfw", String(FW_VERSION));
+  prefs.end();
+  rtcOtaTrialBoots = 0;
+  esp_ota_mark_app_valid_cancel_rollback();
+  fwConfirmed = true;
+  Serial.println("[ota] FW " + String(FW_VERSION) + " confirmed healthy - marked good, rollback disarmed");
+}
+
 void setup() {
   Serial.begin(115200);
   delay(300);
 
   resolveIdentity();
+  otaRollbackGate();                                // decide trust / revert BEFORE any risky init re-runs a crash
 
   WiFi.mode(WIFI_STA);
   WiFi.persistent(true);
@@ -1531,6 +1596,17 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+
+  confirmFirmwareIfHealthy();     // mark a freshly-OTA'd build good once it has run cleanly with server contact
+
+  // Connectivity-break guard: a new (unconfirmed) build that never once reached the server in 10 min is the
+  // one failure the offline watchdog below can't catch (it requires a prior connection). Reboot so the trial
+  // counter advances toward a rollback. A healthy build confirms at 60s and never reaches this.
+  if (!fwConfirmed && !everConnected && now > OTA_UNCONFIRMED_REBOOT_MS) {
+    Serial.println("[ota] unconfirmed build never reached the server in 10 min - rebooting to advance the trial");
+    delay(50);
+    ESP.restart();
+  }
 
   // Offline watchdog: if the board can't reach the server for OFFLINE_REBOOT_TIMEOUT,
   // it's stuck (wedged WiFi/TCP) -> hard reboot to force a clean reconnect.
