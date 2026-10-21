@@ -1,4 +1,8 @@
-struct Evt;   // forward-declared before the includes so arduino-cli's injected prototypes (pushEvt(Evt&) etc.) resolve
+// Forward-declare structs used in function signatures BEFORE the includes. arduino-cli injects the
+// auto-generated function prototypes (e.g. postOneMachineEvt(const MachineEvt&)) right after the include
+// block - above where these structs are defined - so without this the ESP32 3.x toolchain fails with
+// "'MachineEvt' does not name a type". A forward declaration here is seen before any injected prototype.
+struct MachineEvt;
 #include <SPI.h>
 #include <MFRC522.h>
 #include <WiFi.h>
@@ -8,15 +12,6 @@ struct Evt;   // forward-declared before the includes so arduino-cli's injected 
 #include <HTTPUpdate.h>
 #include <Preferences.h>
 #include <time.h>
-#include "esp_timer.h"
-#include "esp_ota_ops.h"
-#include "esp_task_wdt.h"
-#include "esp_system.h"
-#include "esp_heap_caps.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/queue.h"
-#include "freertos/semphr.h"
 
 // ====== IDENTITY ======
 // OTA / generic build: leave these BLANK so each board keeps the identity
@@ -27,14 +22,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.4.2"
-
-// Batch event ingest (Stage 1): the PI-SHEQsys RPC. Auth = _device_id + _key in the body (validated
-// server-side as sha256(_key)==api_key_hash), but PostgREST still needs the project's PUBLIC anon key in
-// the apikey/Bearer headers. This key is published in the web app to every browser - it is NOT a secret and
-// does nothing without a valid device key in the body.
-const char* EVENTS_RPC_URL  = "https://cofrgojpwdyzfhfqnlch.supabase.co/rest/v1/rpc/device_events_push";
-const char* SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNvZnJnb2pwd2R5emZoZnFubGNoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc0Mzg0MjIsImV4cCI6MjA5MzAxNDQyMn0.fc1dOwvHJEhRDDnfOzj4EpqhoN9qE2CWf9T8995yoBM";
+#define FW_VERSION "1.5.0"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -42,6 +30,11 @@ const char* CMD_RESULT_URL  = "https://cofrgojpwdyzfhfqnlch.supabase.co/function
 const char* FW_VERSION_URL  = "https://raw.githubusercontent.com/levilipschitz8-cmd/ESP32S3-OTA-Rfid-brains/main/fw-version.txt";
 const char* FIRMWARE_URL    = "https://github.com/levilipschitz8-cmd/ESP32S3-OTA-Rfid-brains/releases/latest/download/firmware.bin";
 const char* MACHINE_EVENT_URL = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-machine-event";
+// Batch ingest (v1.5.0): one POST carries many events to the device_events_push RPC, stamped with seq + ts
+// so the server stores exact device time and de-dupes. PostgREST needs the PUBLIC anon key in the headers
+// (it is published in the web app; it does nothing without a valid device key in the body).
+const char* EVENTS_RPC_URL  = "https://cofrgojpwdyzfhfqnlch.supabase.co/rest/v1/rpc/device_events_push";
+const char* SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNvZnJnb2pwd2R5emZoZnFubGNoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc0Mzg0MjIsImV4cCI6MjA5MzAxNDQyMn0.fc1dOwvHJEhRDDnfOzj4EpqhoN9qE2CWf9T8995yoBM";
 const char* INJECTION_DEVICE_ID = "ec089dbd-7269-4c1d-86b8-e425400f80bf";  // machine 7 (board 7): injection monitor
 const char* MACHINE6_DEVICE_ID  = "03100ff2-811b-47af-ba77-fe204ec1f9e6";  // machine 6 (board 6): injection monitor
 
@@ -106,82 +99,47 @@ int  NUM_SIGNALS   = sizeof(machine7Signals) / sizeof(machine7Signals[0]);
 bool sigActiveHigh = false;                          // false = LOW is active (machine 7); true = HIGH is active (machine 6)
 const char* machineLabel = "machine 7";
 #define MAX_SIGNALS 8
-
-// ===================== STAGE 1: lossless machine-signal capture + batch ingest =====================
-// A both-edge GPIO ISR timestamps every edge (esp_timer us) into a FreeRTOS queue; a CAPTURE task pinned to
-// CORE 0 debounces (20 ms, stamped at the FIRST transition) and emits one event per real change into a big
-// RAM ring; a SENDER task on CORE 1 batches events to the device_events_push RPC and deletes only what the
-// server acks. Capture never shares a loop with Wi-Fi/HTTP, so sending can never make us miss an edge. Both
-// tasks are fed to the task watchdog so a hang reboots instead of freezing.
-
-// Core signals define a shot and are the only ones checked for stuck/silent: injection, charge,
-// mould_opening, mould_closing. Carriage forward/back are position confirmations - recorded, never judged.
-bool isCoreSignal(const char* n) {
-  return !strcmp(n,"injection") || !strcmp(n,"charge") || !strcmp(n,"mould_opening") || !strcmp(n,"mould_closing");
-}
-
-const unsigned long SIG_DEBOUNCE_US = 20000;         // 20 ms stable to accept a change (per input)
-
-// Raw edge from the ISR: pin index + the level read AT the edge + the esp_timer microsecond stamp.
-struct RawEdge { uint8_t ch; uint8_t level; int64_t tUs; };
-QueueHandle_t rawEdgeQ = nullptr;                    // ISR -> capture task (length 256)
-
-// One captured, debounced event. Compact (pin index, not name) so a deep ring stays affordable.
-struct Evt {
-  uint32_t seq;
-  uint8_t  pin;                                      // index into machineSignals[]; 0xFF = raw_levels
-  uint8_t  active;                                   // 1 = active, 0 = idle
-  uint32_t uptimeMs;                                 // ms at the FIRST transition (boot-relative)
-  uint64_t tsMs;                                     // epoch ms at the FIRST transition (0 until NTP synced)
-  uint32_t pulseMs;                                  // ON duration for idle events (0 otherwise)
-  char     rawlv[12];                                // raw_levels h/l string (pin==0xFF only)
-};
-int   EVT_CAP = 5000;                                // ring capacity (clamped if PSRAM absent)
-Evt*  evtRing = nullptr;
-volatile int evtHead = 0;                            // oldest unsent
-volatile int evtCount = 0;
-portMUX_TYPE evtMux = portMUX_INITIALIZER_UNLOCKED;  // guards evtRing head/count (capture vs sender)
-
-// Per-input capture FSM (capture task only) + rolling diagnostics reported in _status.
-bool          capCommitted[MAX_SIGNALS];             // last committed active/idle
-int8_t        capPend[MAX_SIGNALS];                  // pending level (-1 none, else 0/1 active)
-int64_t       capPendUs[MAX_SIGNALS];                // us of the FIRST transition of the pending change
-uint32_t      capCounter[MAX_SIGNALS];               // rising edges since boot (counters)
-uint32_t      capNoise[MAX_SIGNALS];                 // sub-debounce reversals (noise)
-int64_t       capActiveSinceUs[MAX_SIGNALS];         // us the input last went active (for pulse_ms)
-unsigned long capLastChangeMs[MAX_SIGNALS];          // millis of last committed change (stuck/silent)
-unsigned long capActiveStartMs[MAX_SIGNALS];         // millis the input last went active (stuck check)
-volatile unsigned long injectionShotCount = 0;       // kept for the shot_count field + NVS continuity
-unsigned long lastShotSaved = 0;
-
-// seq counter: survives reboot in RTC, and power loss via NVS (restored on cold boot, saved periodically).
-RTC_NOINIT_ATTR uint32_t rtcSeq;
+volatile bool          sigState[MAX_SIGNALS];       // current debounced electrical state per channel (ISR-owned)
+volatile unsigned long sigLastEdgeUs[MAX_SIGNALS];  // last accepted edge time (us) for per-channel debounce
+volatile unsigned long injectionShotCount = 0;      // shots (injection idle->active edges), persisted to NVS
+unsigned long          lastShotSaved = 0;           // last shot value written to NVS (throttle flash writes)
+// 15 ms debounce: long enough to kill contact bounce, short enough that a real ~30 ms ejector pulse keeps
+// BOTH edges. The old 40 ms window swallowed short pulses (the ON got filtered, only the OFF survived).
+const unsigned long SIG_DEBOUNCE_US = 15000;
+// ---- Raw per-edge ring (ISR -> loop). EVERY debounced edge is queued here with its own millis(), so a
+// short ON/OFF pair is never collapsed into a single state read even if the loop is stalled in a blocking
+// POST. This is what guarantees "never drop an edge because the pulse was short".
+struct RawEdge { uint8_t ch; bool active; unsigned long tMs; unsigned long shots; };
+const int        RAW_EDGE_N = 1024;                 // big enough to hold every edge through a ~1 s batch POST (no loss)
+volatile RawEdge rawEdges[RAW_EDGE_N];
+volatile int     rawHead = 0, rawTail = 0;          // head = next write (ISR), tail = next read (loop)
+// Per-channel loop-side bookkeeping for pulse_ms + missed-ON reconstruction (NOT touched by the ISR).
+unsigned long    sigOnMs[MAX_SIGNALS];              // millis() of the last ON edge seen (for pulse_ms)
+bool             lastSentActive[MAX_SIGNALS];        // was the last event we SENT for this channel "active"?
+bool             sigArmed[MAX_SIGNALS];              // mould_closing gate: false until GPIO5 toggles once (an unwired pin sits at pull-up forever -> never report)
+// ---- NTP real-time + boot-anchor (accurate per-event timestamps) ----
+bool          timeSynced   = false;                 // true once NTP has given us a real UTC epoch
+uint64_t      bootEpochMs  = 0;                      // epoch(ms) at board boot = synced_epoch_ms - millis()
+unsigned long lastNtpCheck = 0;                      // last poll for a valid NTP epoch
+unsigned long lastNtpResync = 0;                     // last re-trigger of SNTP
+unsigned long machineSeq   = 0;                      // monotonic event sequence (restored from RTC across reboots)
+RTC_NOINIT_ATTR uint32_t rtcMachineSeq;              // seq mirror that survives a reboot (not power loss)
 RTC_NOINIT_ATTR uint32_t rtcSeqMagic;
 const uint32_t RTC_SEQ_MAGIC = 0x5EC0FFEE;
-// Boot-stage marker in RTC (survives a crash reboot, not power loss): records how far the LAST boot got
-// before it reset, so a crash is localized even if that boot dies before any task can report. Reported in
-// the early diagnostic post. 1=setup entered, 2=pins armed, 3=tasks created, 4=loop running.
-RTC_NOINIT_ATTR uint32_t rtcStage;
-RTC_NOINIT_ATTR uint32_t rtcStageMagic;
-const uint32_t RTC_STAGE_MAGIC = 0xB007C0DE;
-int prevBootStage = 0;
-volatile uint32_t gSeq = 0;
-uint32_t lastSeqSaved = 0;
-
-TaskHandle_t captureTaskH = nullptr, senderTaskH = nullptr;
-bool pinmapSent = false;                             // pinmap included in _status once per boot
-bool firstOkPost = false;                            // one ok:true POST happened (OTA validation gate)
-SemaphoreHandle_t httpMux = nullptr;                 // serialize all TLS POSTs (no concurrent mbedtls heap spikes)
-int  bootResetReason = 0;                            // esp_reset_reason() at boot - reported in _status for crash diagnosis
-unsigned long lastShotSaveMs = 0;                    // throttle NVS shot-count writes
-
-// ---- NTP real-time + boot-anchor (accurate per-event timestamps) ----
-bool          timeSynced   = false;
-uint64_t      bootEpochMs  = 0;
-unsigned long lastNtpCheck = 0;
-unsigned long lastNtpResync = 0;
-const unsigned long NTP_CHECK_INTERVAL  = 5000;
-const unsigned long NTP_RESYNC_INTERVAL = 3UL * 3600UL * 1000UL;
+const unsigned long NTP_CHECK_INTERVAL  = 5000;      // poll for a valid NTP time this often (non-blocking)
+const unsigned long NTP_RESYNC_INTERVAL = 3UL * 3600UL * 1000UL;   // re-sync SNTP every 3 hours
+// ---- Machine-event RAM ring buffer (offline buffering; survives WiFi outages) ----
+struct MachineEvt {
+  char          signal[24];
+  bool          active;
+  unsigned long shots;
+  unsigned long uptimeMs;    // millis() at the edge -> device_ts = bootEpochMs + uptimeMs
+  unsigned long pulseMs;     // how long the input was ON (idle events); 0 for active events
+  unsigned long seq;
+};
+const int      EVT_BUF_N = 300;                      // hold ~300 events across an outage
+MachineEvt     evtBuf[EVT_BUF_N];
+int            evtHead = 0, evtCount = 0;            // FIFO ring (oldest at evtHead)
 String currentUID = "";
 byte lastReaderVersion = 0;             // last RC522 version byte read (for the status line)
 unsigned long lastSeenAt = 0;
@@ -191,8 +149,6 @@ unsigned long lastWifiCheckAt = 0;
 unsigned long lastOtaAt = 0;            // millis() stamped when the last OTA check RETURNED (0 = none yet)
 bool          otaInProgress = false;    // an OTA download/flash is running right now (heartbeat sends ota_in_s=0)
 String        lastOtaResult = "pending"; // ok|no_update|http_404|flash_fail|http_<code>|wifi_down|pending
-bool          otaPendingValidation = false; // new image booted, not yet proven good (rollback gate)
-unsigned long otaBootMs = 0;             // millis at boot, for the 60s validation window
 unsigned long lastReaderCheckAt = 0;
 unsigned long lastStatusAt = 0;         // last time we printed the human status line
 unsigned long lastCloseProbeAt = 0;     // last low-power "close tag" probe while searching
@@ -310,19 +266,17 @@ String uidToString(MFRC522::Uid uid) {
 
 int postJson(const char* url, const String& body, String& respOut) {
   if (WiFi.status() != WL_CONNECTED) return -1;
-  if (httpMux && xSemaphoreTake(httpMux, pdMS_TO_TICKS(12000)) != pdTRUE) return -3;  // couldn't get the TLS lock
   WiFiClientSecure client; client.setInsecure();
   HTTPClient http;
   http.setConnectTimeout(4000);
   http.setTimeout(4000);
-  if (!http.begin(client, url)) { if (httpMux) xSemaphoreGive(httpMux); return -2; }
+  if (!http.begin(client, url)) return -2;
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Device-Id", deviceId);
   http.addHeader("X-Device-Key", deviceKey);
   int code = http.POST(body);
   respOut = http.getString();
   http.end();
-  if (httpMux) xSemaphoreGive(httpMux);
   // ANY successful post (heartbeat, tag event, command result, machine event) counts as server contact.
   // This stops the offline watchdog from rebooting a board that is busy and successfully talking to the
   // server (e.g. processing a queue of writes) just because a plain heartbeat hasn't fired in a while.
@@ -890,26 +844,33 @@ void sendHeartbeat() {
   if (code == 200) { firstBeat = false; everConnected = true; lastGoodContactAt = millis(); handleCommand(resp); }
 }
 
-// Both-edge interrupt (one per input, channel index passed as arg). Minimal and in IRAM: timestamp the edge
-// with esp_timer (us) and hand it to the capture task. Interrupts preempt everything, so an edge is captured
-// even while the loop or sender is mid-HTTP. All debounce/state/shot logic lives in captureTask on core 0.
+// Per-channel edge interrupt (machine 7 only): ACTIVE-LOW, debounced, minimal, in IRAM. The channel
+// index is passed as the ISR arg so all seven signals share one handler. Interrupt (not 10 ms polling)
+// so an edge is still captured even while the loop is stalled in a blocking HTTP post - strictly better
+// than polling, which would miss an edge that falls inside a network call. On the injection channel a
+// clean idle(HIGH)->active(LOW) edge counts exactly one shot (never repeats while it stays LOW).
 void IRAM_ATTR machineSignalISR(void* arg) {
-  BaseType_t hpw = pdFALSE;
-  RawEdge e;
-  e.ch    = (uint8_t)(int)(intptr_t)arg;
-  e.level = (uint8_t)digitalRead(machineSignals[e.ch].pin);      // level AT the edge
-  e.tUs   = esp_timer_get_time();                                // microsecond stamp of the edge
-  if (rawEdgeQ) xQueueSendFromISR(rawEdgeQ, &e, &hpw);           // ALL debounce/state logic is in the core-0 task
-  if (hpw) portYIELD_FROM_ISR();
+  int i = (int)(intptr_t)arg;
+  unsigned long nowUs = micros();
+  if (nowUs - sigLastEdgeUs[i] < SIG_DEBOUNCE_US) return;         // debounce contact bounce (15 ms)
+  sigLastEdgeUs[i] = nowUs;
+  bool active = (digitalRead(machineSignals[i].pin) == (sigActiveHigh ? HIGH : LOW));  // per-machine polarity
+  if (active == sigState[i]) return;                             // no real level change -> ignore
+  sigState[i] = active;
+  if (active && machineSignals[i].isInjection) injectionShotCount++;  // idle->active edge = one shot
+  int nxt = (rawHead + 1) % RAW_EDGE_N;
+  if (nxt == rawTail) return;                                    // ring full (loop stalled) -> drop; idle-side reconstruction recovers a missed ON
+  rawEdges[rawHead].ch     = (uint8_t)i;
+  rawEdges[rawHead].active = active;
+  rawEdges[rawHead].tMs    = millis();                           // real uptime AT the edge (for device_ts + pulse_ms)
+  rawEdges[rawHead].shots  = injectionShotCount;
+  rawHead = nxt;
 }
 
 // POST one machine signal state change to Supabase (machine 7). Reuses the SAME X-Device-Id/
 // X-Device-Key auth as the heartbeat. Server stamps the time (created_at); we send which signal,
 // its new state, the running shot count and uptime.
 // ISO 8601 UTC with milliseconds from an epoch-ms value.
-// Arduino String has no 64-bit constructor; format epoch-ms (and any uint64) via snprintf.
-String u64str(uint64_t v) { char b[21]; snprintf(b, sizeof(b), "%llu", (unsigned long long)v); return String(b); }
-
 String isoFromEpochMs(uint64_t epochMs) {
   time_t s = (time_t)(epochMs / 1000ULL);
   int ms = (int)(epochMs % 1000ULL);
@@ -947,196 +908,96 @@ void ntpService() {
   }
 }
 
-// Add a finished event to the RAM ring (under the spinlock). Assigns the next seq here so the counter is
-// serialized across the capture and sender tasks. If the ring is full, drop the OLDEST.
-void pushEvt(Evt& ev) {
-  portENTER_CRITICAL(&evtMux);
-  ev.seq = ++gSeq; rtcSeq = gSeq;                                     // seq survives reboot via RTC
-  int idx = (evtHead + evtCount) % EVT_CAP;
-  evtRing[idx] = ev;
-  if (evtCount < EVT_CAP) evtCount++;
-  else evtHead = (evtHead + 1) % EVT_CAP;
-  portEXIT_CRITICAL(&evtMux);
+// Append an edge event to the ring buffer (drops the OLDEST if full - keeps the most recent ~300).
+void enqueueMachineEvt(const char* name, bool active, unsigned long shots, unsigned long uptimeMs, unsigned long pulseMs) {
+  int idx = (evtHead + evtCount) % EVT_BUF_N;
+  strncpy(evtBuf[idx].signal, name, sizeof(evtBuf[idx].signal) - 1);
+  evtBuf[idx].signal[sizeof(evtBuf[idx].signal) - 1] = '\0';
+  evtBuf[idx].active   = active;
+  evtBuf[idx].shots    = shots;
+  evtBuf[idx].uptimeMs = uptimeMs;
+  evtBuf[idx].pulseMs  = pulseMs;
+  evtBuf[idx].seq      = ++machineSeq;
+  rtcMachineSeq        = (uint32_t)machineSeq;        // survive a reboot
+  if (evtCount < EVT_BUF_N) evtCount++;
+  else evtHead = (evtHead + 1) % EVT_BUF_N;                           // full -> overwrite oldest
 }
 
-// Current raw pin levels as an H/L string in machineSignals order (8th char = mould_closing).
-void rawLevelsStr(char* out, int cap) {
-  int n = 0;
-  for (int i = 0; i < NUM_SIGNALS && n < cap - 1; i++)
-    out[n++] = (digitalRead(machineSignals[i].pin) == HIGH) ? 'H' : 'L';
-  out[n] = '\0';
-}
+// Arduino String has no 64-bit constructor; format epoch-ms via snprintf.
+String u64str(uint64_t v) { char b[21]; snprintf(b, sizeof(b), "%llu", (unsigned long long)v); return String(b); }
 
-// CORE 0: drain raw edges, debounce 20 ms per input (commit stamped at the FIRST transition), emit one
-// event per committed change, maintain rising-edge counters + noise. Never touches Wi-Fi/HTTP.
-void captureTask(void* pv) {
-  esp_task_wdt_add(NULL);
-  RawEdge e;
-  for (;;) {
-    esp_task_wdt_reset();
-    while (xQueueReceive(rawEdgeQ, &e, pdMS_TO_TICKS(4)) == pdTRUE) {
-      int i = e.ch;
-      if (i < 0 || i >= NUM_SIGNALS) continue;
-      bool active = (e.level == (sigActiveHigh ? HIGH : LOW));
-      if (active == capCommitted[i]) {                               // returned to committed level = bounce
-        if (capPend[i] != -1) { capNoise[i]++; capPend[i] = -1; }
-        continue;
-      }
-      if (capPend[i] != (int8_t)active) {                            // new pending change -> stamp FIRST transition
-        if (capPend[i] != -1) capNoise[i]++;
-        capPend[i]   = (int8_t)active;
-        capPendUs[i] = e.tUs;
-      }
-    }
-    int64_t nowUs = esp_timer_get_time();
-    for (int i = 0; i < NUM_SIGNALS; i++) {
-      if (capPend[i] == -1) continue;
-      if (nowUs - capPendUs[i] < (int64_t)SIG_DEBOUNCE_US) continue; // not yet stable 20 ms
-      bool active = (capPend[i] != 0);
-      capPend[i] = -1;
-      capCommitted[i] = active;
-      capLastChangeMs[i] = millis();
-      Evt ev; memset(&ev, 0, sizeof(ev));
-      ev.pin      = (uint8_t)i;
-      ev.active   = active ? 1 : 0;
-      ev.uptimeMs = (uint32_t)(capPendUs[i] / 1000);
-      ev.tsMs     = timeSynced ? (bootEpochMs + (uint64_t)(capPendUs[i] / 1000)) : 0;
-      if (active) {
-        capActiveSinceUs[i] = capPendUs[i];
-        capActiveStartMs[i] = millis();
-        capCounter[i]++;                                             // rising edge
-        if (machineSignals[i].isInjection) injectionShotCount++;
-        ev.pulseMs = 0;
-      } else {
-        ev.pulseMs = capActiveSinceUs[i] ? (uint32_t)((capPendUs[i] - capActiveSinceUs[i]) / 1000) : 0;
-      }
-      pushEvt(ev);
-    }
-  }
-}
-
-const char* evtSignalName(const Evt& ev) {
-  return (ev.pin == 0xFF) ? "raw_levels" : machineSignals[ev.pin].name;
-}
-
-// Build the _status object: last_seq, buffered, per-input counters + noise, stuck/silent (core signals only,
-// never carriage), pinmap (once per boot), fw. Called from the sender.
-String buildStatusJson() {
-  unsigned long now = millis();
-  unsigned long recentChange = 0;
-  for (int i = 0; i < NUM_SIGNALS; i++) if (capLastChangeMs[i] > recentChange) recentChange = capLastChangeMs[i];
-  bool othersCycling = (recentChange != 0) && (now - recentChange < 600000UL);
-  String s = "{\"last_seq\":" + String(gSeq) + ",\"buffered\":" + String(evtCount) + ",\"fw\":\"" + FW_VERSION + "\"";
-  s += ",\"reset_reason\":" + String(bootResetReason) +            // why the board last rebooted (crash diagnosis)
-       ",\"heap\":" + String((unsigned)esp_get_free_heap_size()) +
-       ",\"heap_min\":" + String((unsigned)esp_get_minimum_free_heap_size());
-  s += ",\"counters\":{"; for (int i = 0; i < NUM_SIGNALS; i++) { if (i) s += ","; s += "\"" + String(machineSignals[i].name) + "\":" + String(capCounter[i]); } s += "}";
-  s += ",\"noise\":{";    for (int i = 0; i < NUM_SIGNALS; i++) { if (i) s += ","; s += "\"" + String(machineSignals[i].name) + "\":" + String(capNoise[i]); }    s += "}";
-  String stuck = "", silent = "";
-  for (int i = 0; i < NUM_SIGNALS; i++) {
-    if (!isCoreSignal(machineSignals[i].name)) continue;            // never judge carriage/ejectors
-    if (capCommitted[i] && othersCycling && capActiveStartMs[i] && (now - capActiveStartMs[i]) > 600000UL) {
-      if (stuck.length()) stuck += ","; stuck += "\"" + String(machineSignals[i].name) + "\"";
-    }
-    if (othersCycling && capLastChangeMs[i] && (now - capLastChangeMs[i]) > 86400000UL) {
-      if (silent.length()) silent += ","; silent += "\"" + String(machineSignals[i].name) + "\"";
-    }
-  }
-  s += ",\"stuck\":[" + stuck + "],\"silent\":[" + silent + "]";
-  if (!pinmapSent) {
-    s += ",\"pinmap\":{";
-    for (int i = 0; i < NUM_SIGNALS; i++) { if (i) s += ",";
-      s += "\"" + String(machineSignals[i].name) + "\":{\"gpio\":" + String(machineSignals[i].pin) +
-           ",\"active_high\":" + (sigActiveHigh ? "true" : "false") + "}"; }
-    s += "}";
-  }
-  s += "}";
-  return s;
-}
-
-// POST up to 500 oldest events + _status to the device_events_push RPC (anon key in headers, device creds in
-// body). On ok:true the server has durably stored everything it received, so `ackedOut` = events sent.
-bool postEventsBatch(int& ackedOut) {
-  ackedOut = 0;
-  if (WiFi.status() != WL_CONNECTED) return false;
-  String events = "";
-  int sent = 0;
-  if (timeSynced) {                                                  // hold events until the clock is real
-    portENTER_CRITICAL(&evtMux);
-    int n = evtCount; if (n > 120) n = 120;            // smaller batches = smaller Strings = less heap pressure
-    int idx = evtHead;
-    portEXIT_CRITICAL(&evtMux);
-    events.reserve(14336);
-    for (int k = 0; k < n; k++) {
-      Evt ev = evtRing[idx];
-      idx = (idx + 1) % EVT_CAP;
-      uint64_t ts = ev.tsMs ? ev.tsMs : (bootEpochMs + (uint64_t)ev.uptimeMs);  // backfill pre-sync events
-      if (events.length()) events += ",";
-      events += "{\"seq\":" + String(ev.seq) +
-                ",\"signal\":\"" + String(evtSignalName(ev)) + "\"" +
-                ",\"state\":\"" + (ev.pin == 0xFF ? String(ev.rawlv) : String(ev.active ? "active" : "idle")) + "\"" +
-                ",\"shot_count\":" + String(injectionShotCount) +
-                ",\"uptime_ms\":" + String(ev.uptimeMs) +
-                ",\"ts\":" + u64str(ts) +
-                ",\"pulse_ms\":" + String(ev.pulseMs) + "}";
-      sent++;
-    }
-  }
-  String body; body.reserve(events.length() + 2048);
-  body = String("{\"_device_id\":\"") + deviceId + "\",\"_key\":\"" + deviceKey +
-         "\",\"_events\":[" + events + "],\"_status\":" + buildStatusJson() + "}";
-  if (httpMux && xSemaphoreTake(httpMux, pdMS_TO_TICKS(12000)) != pdTRUE) return false;  // serialize with heartbeat TLS
+// POST to the device_events_push RPC (anon key in headers, device creds in the body). Returns HTTP code.
+int postJsonRpc(const char* url, const String& body, String& respOut) {
+  if (WiFi.status() != WL_CONNECTED) return -1;
   WiFiClientSecure client; client.setInsecure();
   HTTPClient http;
   http.setConnectTimeout(5000); http.setTimeout(8000);
-  if (!http.begin(client, EVENTS_RPC_URL)) { if (httpMux) xSemaphoreGive(httpMux); return false; }
+  if (!http.begin(client, url)) return -2;
   http.addHeader("Content-Type", "application/json");
   http.addHeader("apikey", SUPABASE_ANON_KEY);
   http.addHeader("Authorization", String("Bearer ") + SUPABASE_ANON_KEY);
   int code = http.POST(body);
-  String resp = http.getString();
+  respOut = http.getString();
   http.end();
-  if (httpMux) xSemaphoreGive(httpMux);
-  bool ok = (code >= 200 && code < 300) && resp.indexOf("\"ok\":true") >= 0;
-  if (ok) { lastGoodContactAt = millis(); firstOkPost = true; pinmapSent = true; ackedOut = sent; }
-  else Serial.println("[rpc] POST code=" + String(code) + " ok=0 resp=" + resp.substring(0, 80));
-  return ok;
+  if (code >= 200 && code < 300) lastGoodContactAt = millis();
+  return code;
 }
 
-// CORE 1: every 1 s (or at >=50 queued) POST a batch and delete only what the server acked. Pushes a
-// raw_levels snapshot into the ring every 5 s, and forces a _status at least every 60 s.
-void senderTask(void* pv) {
-  esp_task_wdt_add(NULL);
-  unsigned long lastSend = 0, lastRaw = 0, lastStatus = 0;
-  for (;;) {
-    esp_task_wdt_reset();
-    unsigned long now = millis();
-    if (!otaInProgress && injectionArmed && now - lastRaw >= 5000) {         // raw_levels every 5 s (deduped/acked like any event)
-      lastRaw = now;
-      Evt ev; memset(&ev, 0, sizeof(ev));
-      ev.pin = 0xFF; ev.active = 0;
-      ev.uptimeMs = (uint32_t)(esp_timer_get_time() / 1000);
-      ev.tsMs = timeSynced ? (bootEpochMs + ev.uptimeMs) : 0;
-      rawLevelsStr(ev.rawlv, sizeof(ev.rawlv));
-      pushEvt(ev);
-    }
-    bool due = (now - lastSend >= 1000) || (evtCount >= 50) || (now - lastStatus >= 60000);
-    if (!otaInProgress && due) {
-      int acked = 0;
-      if (postEventsBatch(acked)) {
-        lastSend = now; lastStatus = now;
-        if (acked > 0) {
-          portENTER_CRITICAL(&evtMux);
-          int rem = acked; if (rem > evtCount) rem = evtCount;
-          evtHead = (evtHead + rem) % EVT_CAP; evtCount -= rem;
-          portEXIT_CRITICAL(&evtMux);
-        }
-      } else {
-        lastSend = now;                                                      // retry next tick; events stay buffered
-      }
-    }
-    vTaskDelay(pdMS_TO_TICKS(100));
+// Send up to 100 of the OLDEST buffered events in ONE POST to the RPC, each with seq + real ts (epoch ms,
+// boot-anchored) + pulse_ms. Returns how many were durably stored (ok:true) so the caller can drop them;
+// dedup by seq server-side makes a resend always safe. 0 = nothing sent / failed (events kept).
+int postEventsBatch() {
+  int n = evtCount; if (n > 100) n = 100;
+  if (n <= 0) return 0;
+  String events; events.reserve(12288);
+  int idx = evtHead;
+  for (int k = 0; k < n; k++) {
+    const MachineEvt& e = evtBuf[idx];
+    idx = (idx + 1) % EVT_BUF_N;
+    uint64_t ts = bootEpochMs + (uint64_t)e.uptimeMs;              // real UTC ms at the edge (clock is set)
+    if (events.length()) events += ",";
+    events += "{\"seq\":" + String(e.seq) +
+              ",\"signal\":\"" + String(e.signal) + "\"" +
+              ",\"state\":\"" + String(e.active ? "active" : "idle") + "\"" +
+              ",\"shot_count\":" + String(e.shots) +
+              ",\"uptime_ms\":" + String(e.uptimeMs) +
+              ",\"ts\":" + u64str(ts) +
+              ",\"pulse_ms\":" + String(e.pulseMs) + "}";
   }
+  String status = String("{\"last_seq\":") + String(machineSeq) + ",\"buffered\":" + String(evtCount) +
+                  ",\"fw\":\"" + FW_VERSION + "\"}";
+  String body = String("{\"_device_id\":\"") + deviceId + "\",\"_key\":\"" + deviceKey +
+                "\",\"_events\":[" + events + "],\"_status\":" + status + "}";
+  String resp;
+  int code = postJsonRpc(EVENTS_RPC_URL, body, resp);
+  bool ok = (code >= 200 && code < 300) && resp.indexOf("\"ok\":true") >= 0;
+  if (!ok) Serial.println("[rpc] batch code=" + String(code) + " resp=" + resp.substring(0, 80));
+  return ok ? n : 0;
+}
+
+// Flush the buffer to the RPC in batches, oldest first. Holds until the clock is set so every ts is
+// accurate. Drops only what the server acked; stops on the first failure (events kept, retried next loop).
+void flushMachineEvents() {
+  if (WiFi.status() != WL_CONNECTED) return;                         // offline -> keep buffering
+  if (!timeSynced) return;                                           // no accurate time yet -> hold
+  int guard = 0;
+  while (evtCount > 0 && guard++ < 20) {
+    int acked = postEventsBatch();
+    if (acked <= 0) break;                                           // failed -> retry later, keep order
+    evtHead = (evtHead + acked) % EVT_BUF_N;
+    evtCount -= acked;
+  }
+}
+
+void postMachineSignal(const char* name, bool active, unsigned long shots) {
+  String resp;
+  String body = String("{\"signal\":\"") + name +
+                "\",\"state\":\"" + (active ? "active" : "idle") +
+                "\",\"shot_count\":" + String(shots) +
+                ",\"uptime_ms\":" + String(millis()) + "}";
+  int code = postJson(MACHINE_EVENT_URL, body, resp);
+  Serial.println("[mach] " + String(name) + " " + String(active ? "ACTIVE" : "idle") +
+                 " shot#" + String(shots) + " -> code=" + String(code));
 }
 
 // Persist the injection shot count across reboots (NVS), throttled so we only touch flash when the
@@ -1177,22 +1038,13 @@ void checkOTA() {
   // A newer, targeted build exists -> download + flash. On success httpUpdate auto-reboots (we won't
   // return); on failure we record why.
   Serial.println("[ota] " + String(FW_VERSION) + " -> " + remoteVer + " ... downloading");
-  otaInProgress = true;                                          // sender/raw_levels pause on this flag
-  if (captureTaskH) vTaskSuspend(captureTaskH);                  // freeze capture + sender during the flash write
-  if (senderTaskH)  vTaskSuspend(senderTaskH);
   if (injectionArmed)                                            // no ISR during flash write
     for (int i = 0; i < NUM_SIGNALS; i++) detachInterrupt(digitalPinToInterrupt(machineSignals[i].pin));
+  otaInProgress = true;
   WiFiClientSecure up; up.setInsecure();
   httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   t_httpUpdate_return r = httpUpdate.update(up, FIRMWARE_URL);
   otaInProgress = false;
-  if (r != HTTP_UPDATE_OK) {                                     // success reboots; on failure resume capture
-    if (injectionArmed)
-      for (int i = 0; i < NUM_SIGNALS; i++)
-        attachInterruptArg(digitalPinToInterrupt(machineSignals[i].pin), machineSignalISR, (void*)(intptr_t)i, CHANGE);
-    if (captureTaskH) vTaskResume(captureTaskH);
-    if (senderTaskH)  vTaskResume(senderTaskH);
-  }
   if (r == HTTP_UPDATE_FAILED) {
     int err = httpUpdate.getLastError();
     lastOtaResult = (err == HTTP_UE_SERVER_FILE_NOT_FOUND || err == HTTP_UE_SERVER_FORBIDDEN) ? "http_404" : "flash_fail";
@@ -1201,47 +1053,6 @@ void checkOTA() {
     lastOtaResult = "no_update";
   } else {
     lastOtaResult = "ok";                                        // reached only if reboot is somehow deferred
-  }
-}
-
-// ---- OTA validation + rollback (app-level) ----
-// A freshly OTA'd image must PROVE itself: Wi-Fi up, one ok:true POST to device_events_push, and 60 s with
-// no crash/watchdog reboot. Only then is it marked valid. If it crash-loops (boots 3x without validating),
-// revert to the previous working image. True bootloader auto-rollback needs a custom bootloader config the
-// Arduino build doesn't ship, so this is the app-level equivalent: it catches runtime faults that boot far
-// enough to run this code (the realistic risk); a binary that faults before setup() still needs a USB flash.
-void otaValidateInit() {
-  otaBootMs = millis();
-  prefs.begin("ota", false);
-  String validated = prefs.getString("valid_ver", "");
-  if (validated == FW_VERSION) {
-    prefs.putUInt("boot_try", 0);
-    otaPendingValidation = false;
-  } else {
-    uint32_t tries = prefs.getUInt("boot_try", 0) + 1;
-    prefs.putUInt("boot_try", tries);
-    otaPendingValidation = true;
-    Serial.println("[ota] new image " + String(FW_VERSION) + " pending validation (boot try " + String(tries) + ")");
-    if (tries >= 3) {
-      Serial.println("[ota] crash-looping unvalidated -> rolling back to previous image");
-      prefs.end();
-      esp_ota_mark_app_invalid_rollback_and_reboot();            // reverts + reboots if a prior app exists
-      prefs.begin("ota", false);                                 // (only reached if rollback isn't possible)
-    }
-  }
-  prefs.end();
-}
-
-void otaValidateTick() {
-  if (!otaPendingValidation) return;
-  if (WiFi.status() == WL_CONNECTED && firstOkPost && (millis() - otaBootMs >= 60000)) {
-    prefs.begin("ota", false);
-    prefs.putString("valid_ver", FW_VERSION);
-    prefs.putUInt("boot_try", 0);
-    prefs.end();
-    esp_ota_mark_app_valid_cancel_rollback();                    // harmless no-op if not in pending-verify
-    otaPendingValidation = false;
-    Serial.println("[ota] image validated (wifi + ok:true post + 60s) - locked in");
   }
 }
 
@@ -1613,39 +1424,11 @@ void pollRfid() {
   }
 }
 
-// Post the previous boot's reset reason + furthest stage + heap to the RPC _status, BEFORE the risky capture
-// /sender tasks start - so a crash under load is always visible on the next boot (reset_reason tells us
-// panic vs task-WDT vs int-WDT vs brownout; prev_stage tells us where it died).
-void earlyDiagPost() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  String body = String("{\"_device_id\":\"") + deviceId + "\",\"_key\":\"" + deviceKey +
-    "\",\"_events\":[],\"_status\":{\"fw\":\"" + FW_VERSION + "\",\"reset_reason\":" + String(bootResetReason) +
-    ",\"prev_stage\":" + String(prevBootStage) + ",\"heap\":" + String((unsigned)esp_get_free_heap_size()) +
-    ",\"boot\":true}}";
-  if (httpMux && xSemaphoreTake(httpMux, pdMS_TO_TICKS(10000)) != pdTRUE) return;
-  WiFiClientSecure client; client.setInsecure();
-  HTTPClient http; http.setConnectTimeout(5000); http.setTimeout(8000);
-  if (http.begin(client, EVENTS_RPC_URL)) {
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("apikey", SUPABASE_ANON_KEY);
-    http.addHeader("Authorization", String("Bearer ") + SUPABASE_ANON_KEY);
-    int code = http.POST(body);
-    http.end();
-    Serial.println("[diag] boot post code=" + String(code) + " reset=" + String(bootResetReason) + " prevStage=" + String(prevBootStage));
-  }
-  if (httpMux) xSemaphoreGive(httpMux);
-}
-
 void setup() {
   Serial.begin(115200);
   delay(300);
 
   resolveIdentity();
-  bootResetReason = (int)esp_reset_reason();   // capture WHY we last rebooted before anything can change it
-  prevBootStage = (rtcStageMagic == RTC_STAGE_MAGIC) ? (int)rtcStage : 0;   // how far the last boot got
-  rtcStageMagic = RTC_STAGE_MAGIC; rtcStage = 1;                            // stage 1 = setup entered
-  httpMux = xSemaphoreCreateMutex();           // all TLS POSTs serialize on this (heartbeat + sender RPC)
-  otaValidateInit();                     // start the OTA rollback gate: this image must prove itself in 60 s
 
   WiFi.mode(WIFI_STA);
   WiFi.persistent(true);
@@ -1674,8 +1457,6 @@ void setup() {
   // and sets the boot anchor; events captured before then are buffered and backfilled.
   configTime(0, 0, "pool.ntp.org", "time.google.com");
   lastNtpResync = millis();
-
-  earlyDiagPost();   // report prev reset_reason + stage BEFORE arming the capture/sender tasks (crash-proof)
 
   if (deviceId != "" && deviceKey != "")
     Serial.println("[id] board=" + String(boardNum) + " code=" + boardCode + " id=" + deviceId + " keyLen=" + String(deviceKey.length()));
@@ -1709,50 +1490,28 @@ void setup() {
     injectionShotCount = prefs.getULong("shots", 0);
     prefs.end();
     lastShotSaved = injectionShotCount;
-    // seq: prefer RTC (survives reboot); on a cold boot (RTC lost) restore from NVS. Monotonic across both.
-    if (rtcSeqMagic != RTC_SEQ_MAGIC) {
-      prefs.begin("seqs", true); gSeq = prefs.getUInt("seq", 0); prefs.end();
-      rtcSeqMagic = RTC_SEQ_MAGIC;
-    } else {
-      gSeq = rtcSeq;
-    }
-    rtcSeq = gSeq; lastSeqSaved = gSeq;
-    // Event ring: prefer PSRAM (big), fall back to internal RAM (clamped - the real need over a 2 min outage
-    // is only a few hundred events, so even the fallback is ample).
-    if (!evtRing) {
-      evtRing = (Evt*)heap_caps_malloc((size_t)EVT_CAP * sizeof(Evt), MALLOC_CAP_SPIRAM);
-      if (!evtRing) { EVT_CAP = 1500; evtRing = (Evt*)heap_caps_malloc((size_t)EVT_CAP * sizeof(Evt), MALLOC_CAP_8BIT); }
-      if (!evtRing) { EVT_CAP = 600;  evtRing = (Evt*)malloc((size_t)EVT_CAP * sizeof(Evt)); }
-    }
-    rawEdgeQ = xQueueCreate(256, sizeof(RawEdge));
-    Serial.println("[mach] GPIO MAP (" + String(machineLabel) + ")  ring=" + String(EVT_CAP) + " seq=" + String(gSeq));
+    // Restore the event seq from RTC so it keeps counting up across a reboot (0 on a cold/power-loss boot).
+    if (rtcSeqMagic == RTC_SEQ_MAGIC) machineSeq = rtcMachineSeq;
+    else { rtcSeqMagic = RTC_SEQ_MAGIC; rtcMachineSeq = 0; machineSeq = 0; }
+    // Startup self-test: print the GPIO map only. It does NOT post events or touch the shot count.
+    Serial.println("[mach] GPIO MAP (" + String(machineLabel) + ")  pos  signal            gpio  active-level");
     for (int i = 0; i < NUM_SIGNALS; i++) {
-      // Pull toward IDLE so an unconnected/idle input can't float: active-HIGH boards pull DOWN (idle=LOW);
-      // machine 7 (active-LOW) pulls UP (idle=HIGH). Kills the M1/M7 floating-input phantom edges.
-      pinMode(machineSignals[i].pin, sigActiveHigh ? INPUT_PULLDOWN : INPUT_PULLUP);
-      bool active = (digitalRead(machineSignals[i].pin) == (sigActiveHigh ? HIGH : LOW));
-      capCommitted[i]     = active;
-      capPend[i]          = -1;
-      capCounter[i]       = 0;
-      capNoise[i]         = 0;
-      capActiveSinceUs[i] = active ? esp_timer_get_time() : 0;
-      capActiveStartMs[i] = active ? millis() : 0;
-      capLastChangeMs[i]  = 0;
+      pinMode(machineSignals[i].pin, INPUT_PULLUP);
+      sigState[i]       = (digitalRead(machineSignals[i].pin) == (sigActiveHigh ? HIGH : LOW));  // seed with the live level
+      sigLastEdgeUs[i]  = 0;
+      sigOnMs[i]        = 0;
+      lastSentActive[i] = sigState[i];   // boots ACTIVE -> treat as already-sent so the first OFF isn't "recovered"
+      // mould_closing starts DISARMED: an unwired GPIO5 rests at the pull-up level forever, so hold its
+      // events until it proves it's wired by toggling once. Every other channel is armed from boot.
+      sigArmed[i]       = (strcmp(machineSignals[i].name, "mould_closing") != 0);
       attachInterruptArg(digitalPinToInterrupt(machineSignals[i].pin),
                          machineSignalISR, (void*)(intptr_t)i, CHANGE);
       Serial.println("   [mach]   " + String(i + 1) + "   " + machineSignals[i].name +
                      "  gpio" + String(machineSignals[i].pin) + (sigActiveHigh ? "  HIGH(active)  now=" : "  LOW(active)  now=") +
-                     String(active ? "ACTIVE" : "idle"));
+                     String(digitalRead(machineSignals[i].pin) == (sigActiveHigh ? HIGH : LOW) ? "ACTIVE" : "idle"));
     }
     injectionArmed = true;
-    // Task watchdog longer than any legit POST (8 s) so it catches true hangs, not slow servers.
-    esp_task_wdt_config_t twdt = { .timeout_ms = 30000, .idle_core_mask = 0, .trigger_panic = true };
-    esp_task_wdt_reconfigure(&twdt);
-    rtcStage = 2;                                                                         // pins armed + ISRs attached
-    xTaskCreatePinnedToCore(captureTask, "capture", 6144,  NULL, 10, &captureTaskH, 0);  // core 0
-    xTaskCreatePinnedToCore(senderTask,  "sender",  16384, NULL, 5,  &senderTaskH,  1);  // core 1 (TLS + JSON)
-    rtcStage = 3;                                                                         // tasks created
-    Serial.println("[mach] ARMED " + String(machineLabel) + " " + String(NUM_SIGNALS) + (sigActiveHigh ? " active-high" : " active-low") + " inputs, shots=" + String(injectionShotCount) + " ring=" + String(EVT_CAP));
+    Serial.println("[mach] ARMED " + String(machineLabel) + " " + String(NUM_SIGNALS) + (sigActiveHigh ? " active-high" : " active-low") + " inputs, shots restored=" + String(injectionShotCount));
   } else {
     Serial.println("[mach] NOT armed - board #" + String(boardNum) + " is not a monitored machine (dormant)");
   }
@@ -1765,7 +1524,6 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
-  rtcStage = 4;                          // loop running = this boot got past setup/tasks cleanly
 
   // Offline watchdog: if the board can't reach the server for OFFLINE_REBOOT_TIMEOUT,
   // it's stuck (wedged WiFi/TCP) -> hard reboot to force a clean reconnect.
@@ -1829,13 +1587,74 @@ void loop() {
     printStatus();
   }
 
-  // Machine capture + sending now run in dedicated tasks (captureTask core 0, senderTask core 1); the loop
-  // never touches the event path. Here we only persist seq + shot count (so they survive a power cut) and
-  // run the OTA validation/rollback gate.
-  if (injectionArmed && gSeq - lastSeqSaved >= 50) {
-    prefs.begin("seqs", false); prefs.putUInt("seq", gSeq); prefs.end();
-    lastSeqSaved = gSeq;
+  // Machine signal changes: the ISR queued EVERY debounced edge (ON and OFF) into rawEdges with its own
+  // millis(), so short ejector pulses keep BOTH edges even across a blocking POST. Drain in order: emit an
+  // "active" on each ON edge; on each OFF edge emit "idle" carrying pulse_ms = (off - on). If an OFF arrives
+  // while the last SENT state for that channel was already idle (a missed ON: ring overflow or sub-debounce
+  // pulse), reconstruct the "active" first from the recorded ON time, so active/idle counts always balance.
+  if (injectionArmed) {
+    while (rawTail != rawHead) {
+      noInterrupts();
+      RawEdge e;
+      e.ch     = rawEdges[rawTail].ch;
+      e.active = rawEdges[rawTail].active;
+      e.tMs    = rawEdges[rawTail].tMs;
+      e.shots  = rawEdges[rawTail].shots;
+      rawTail  = (rawTail + 1) % RAW_EDGE_N;
+      interrupts();
+      const char* name = machineSignals[e.ch].name;
+      if (!sigArmed[e.ch]) {                               // mould_closing: not proven wired yet
+        sigArmed[e.ch]       = true;                       // first real toggle proves it's wired -> arm from here
+        lastSentActive[e.ch] = e.active;                   // adopt this edge as the baseline (do NOT post it)
+        if (e.active) sigOnMs[e.ch] = e.tMs;
+        Serial.println("[edge] " + String(name) + " ARMED (first toggle, not posted) t=" + String(e.tMs));
+        continue;                                          // start posting from the NEXT edge
+      }
+      if (e.active) {
+        sigOnMs[e.ch] = e.tMs;                             // remember when it went ON (for pulse_ms)
+        enqueueMachineEvt(name, true, e.shots, e.tMs, 0);
+        lastSentActive[e.ch] = true;
+        Serial.println("[edge] " + String(name) + " -> ACTIVE t=" + String(e.tMs));
+      } else {
+        if (!lastSentActive[e.ch]) {                       // missed ON -> send it FIRST so counts balance
+          unsigned long onMs = sigOnMs[e.ch] ? sigOnMs[e.ch] : e.tMs;
+          enqueueMachineEvt(name, true, e.shots, onMs, 0);
+          Serial.println("[edge] " + String(name) + " -> ACTIVE (recovered) t=" + String(onMs));
+        }
+        unsigned long onMs = sigOnMs[e.ch];
+        unsigned long pulseMs = (onMs && e.tMs >= onMs) ? (e.tMs - onMs) : 0;
+        enqueueMachineEvt(name, false, e.shots, e.tMs, pulseMs);
+        lastSentActive[e.ch] = false;
+        Serial.println("[edge] " + String(name) + " -> idle t=" + String(e.tMs) + " pulse=" + String(pulseMs) + "ms");
+      }
+      if (machineSignals[e.ch].isInjection) saveShotCount();
+    }
+    flushMachineEvents();                                  // send queued events in order, each own device_ts
   }
-  if (injectionArmed && now - lastShotSaveMs >= 15000) { saveShotCount(); lastShotSaveMs = now; }  // throttle NVS writes
-  otaValidateTick();
+
+  // 1 Hz RAW serial diagnostic (machine 7): the literal level of all 7 pins, once a second, to serial.
+  if (injectionArmed && now - lastRawPrintAt >= 1000) {
+    lastRawPrintAt = now;
+    String lv = "";
+    for (int i = 0; i < NUM_SIGNALS; i++) lv += (digitalRead(machineSignals[i].pin) == HIGH) ? "H" : "L";
+    Serial.println("RAW " + lv);
+  }
+
+  // Raw pin-level snapshot to the backend (machine 7): every LEVEL_SNAP_INTERVAL post the ACTUAL HIGH/
+  // LOW level of all 7 pins straight from digitalRead - bypassing the interrupt/edge path entirely.
+  // One row: signal="raw_levels", state = 8 chars (H/L) in machineSignals order (8th = mould_closing/GPIO5,
+  // appended last; first 7 positions unchanged). If a char flips while
+  // the machine cycles but no active/idle event fires -> detection bug; if a char never flips while its
+  // function cycles -> that pin is electrically static (tap point / wiring). Ground truth on the tablet.
+  if (injectionArmed && now - lastLevelSnapAt >= LEVEL_SNAP_INTERVAL) {
+    lastLevelSnapAt = now;
+    String lv = "";
+    for (int i = 0; i < NUM_SIGNALS; i++)
+      lv += (digitalRead(machineSignals[i].pin) == HIGH) ? "H" : "L";
+    String resp;
+    String body = String("{\"signal\":\"raw_levels\",\"state\":\"") + lv +
+                  "\",\"shot_count\":" + String(injectionShotCount) +
+                  ",\"uptime_ms\":" + String(millis()) + "}";
+    postJson(MACHINE_EVENT_URL, body, resp);
+  }
 }
