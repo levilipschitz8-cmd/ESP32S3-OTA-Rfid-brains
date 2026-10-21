@@ -26,7 +26,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.5.5"
+#define FW_VERSION "1.5.6"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -82,7 +82,7 @@ MachineSignal machine7Signals[] = {
   { 21, "charge",           false },   // raw_levels pos 5 - terminal 106  (plasticizing / screw recovery); moved off GPIO16
   { 40, "carriage_back",    false },   // raw_levels pos 6 - terminal 108
   { 41, "ejecting_back",    false },   // raw_levels pos 7 - terminal 111
-  {  5, "mould_closing",    false },   // raw_levels pos 8 - GPIO5 purple -> MOULD CLOSE (active-LOW, machine-7 polarity); gated until wired
+  {  5, "mould_closing",    false },   // raw_levels pos 8 - GPIO5 purple -> MOULD CLOSE (active-HIGH since v1.5.6); gated until wired
 };
 // Machine 6 (Yizumi UN200A5S, board 6), wired 15 Oct 2026. Its Y-outputs SINK: 24 V at idle, 0 V when
 // active; opto + = signal wire, opto - = 0 V (202), so the opto LED is ON at idle and the GPIO reads
@@ -100,7 +100,7 @@ MachineSignal machine6Signals[] = {
 };
 MachineSignal* machineSignals = machine7Signals;     // chosen at boot by board identity
 int  NUM_SIGNALS   = sizeof(machine7Signals) / sizeof(machine7Signals[0]);
-bool sigActiveHigh = false;                          // false = LOW is active (machine 7); true = HIGH is active (machine 6)
+bool sigActiveHigh = false;                          // set true at boot for every armed machine board (M7 included since v1.5.6)
 const char* machineLabel = "machine 7";
 #define MAX_SIGNALS 8
 volatile bool          sigState[MAX_SIGNALS];       // current CONFIRMED logical state per channel (sampler-owned)
@@ -1615,6 +1615,9 @@ void setup() {
     snprintf(labelBuf, sizeof(labelBuf), "machine %d", isM6 ? 6 : boardNum);
     machineLabel   = labelBuf;
   }
+  // v1.5.6: machine 7 is ACTIVE-HIGH too (Aug bench test: GPIO4 LOW at idle, HIGH during injection;
+  // 21 Oct data: active-low made injection read "on" ~28 s of a ~34 s cycle = inverted). Keeps its own pin list.
+  if (isM7) sigActiveHigh = true;
   if (isM7 || isStd) {
     // Restore the persisted shot count so a reboot doesn't reset it.
     prefs.begin("machine", true);
