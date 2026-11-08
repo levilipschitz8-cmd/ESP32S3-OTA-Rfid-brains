@@ -26,7 +26,7 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.5.6"
+#define FW_VERSION "1.5.7"
 
 const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
 const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
@@ -1354,7 +1354,7 @@ void adoptTag(const String& newUid) {
 String readTagUid() {
   String u = "";
   for (int a = 0; a < 5 && u == ""; a++) u = tryReadOnce();
-  return u;
+  return confirmRead(u);
 }
 
 // Machine 7 ONLY: its strong reader OVER-couples a close tag. Proven by the user: moving the reader AWAY
@@ -1374,6 +1374,26 @@ String sweepReadLevels() {
   }
   setRfFull();                                             // restore full drive + max gain for the steady field
   return u;
+}
+
+// v1.5.7 (Levi, 8 Nov): a NEW tag is only accepted when it reads the SAME UID twice. Machine readers were
+// occasionally reading one byte wrong (bin 0466E4B5CD2A81 came through as 0466E5B5CD2A81 - about 1 machine scan
+// in 6), which made a fake "never mixed" bin and a false "bin arrived with no mix" email. The confirming read uses
+// full power, then low power, then the full drive-level sweep, so a close or weak tag that only reads at one level
+// still confirms. A read that comes back DIFFERENT (or never repeats) is ignored this poll; the next poll tries again.
+String confirmRead(const String& first) {
+  if (first == "") return "";
+  for (int a = 0; a < 3; a++) { String u = tryReadOnce(); if (u == first) return first; }
+  setAntennaDrive(0x44, 0x10, 0x10);
+  for (int a = 0; a < 2; a++) { String u = tryReadOnce(); if (u == first) { setAntennaDrive(0xFF, 0x3F, 0x3F); return first; } }
+  setAntennaDrive(0xFF, 0x3F, 0x3F);
+  for (int L = 0; L < RF_NLEVELS; L++) {
+    setRfLevel(L);
+    for (int a = 0; a < 2; a++) { if (tryReadOnce() == first) { setRfFull(); return first; } }
+  }
+  setRfFull();
+  Serial.println("Tag read not confirmed (ignored): " + first);
+  return "";
 }
 
 void pollRfid() {
@@ -1425,6 +1445,7 @@ void pollRfid() {
     if (strongReader) {
       String sw = sweepReadLevels();
       if (sw == currentUID) { lastSeenAt = millis(); emptySince = 0; reprobeCount = 0; return; }
+      if (sw != "") { sw = confirmRead(sw); if (sw == currentUID) { lastSeenAt = millis(); emptySince = 0; reprobeCount = 0; return; } }
       if (sw != "") { adoptTag(sw); reprobeCount = 0; return; }
     }
     // A weakly-coupled tag may still answer a bare field ping even when it can't complete a select - that
@@ -1492,6 +1513,7 @@ void pollRfid() {
       uid = readTagUid();
     }
   }
+  uid = confirmRead(uid);
   if (uid != "") {
     currentUID = uid;
     lastSeenAt = millis();
