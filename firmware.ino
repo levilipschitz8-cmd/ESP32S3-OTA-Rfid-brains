@@ -26,19 +26,20 @@ const char* DEVICE_ID  = "";
 const char* DEVICE_KEY = "";
 // ======================
 
-#define FW_VERSION "1.5.7"
+#define FW_VERSION "1.5.8"
 
-const char* HEARTBEAT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-heartbeat";
-const char* TAG_EVENT_URL   = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-tag-event";
-const char* CMD_RESULT_URL  = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-command-result";
+// v1.5.8 (14 Nov): server moved from Lovable Cloud to the own Supabase project. ONLY the addresses and the public key changed.
+const char* HEARTBEAT_URL   = "https://wcctsctasnxekcdseman.supabase.co/functions/v1/device-heartbeat";
+const char* TAG_EVENT_URL   = "https://wcctsctasnxekcdseman.supabase.co/functions/v1/device-tag-event";
+const char* CMD_RESULT_URL  = "https://wcctsctasnxekcdseman.supabase.co/functions/v1/device-command-result";
 const char* FW_VERSION_URL  = "https://raw.githubusercontent.com/levilipschitz8-cmd/ESP32S3-OTA-Rfid-brains/main/fw-version.txt";
 const char* FIRMWARE_URL    = "https://github.com/levilipschitz8-cmd/ESP32S3-OTA-Rfid-brains/releases/latest/download/firmware.bin";
-const char* MACHINE_EVENT_URL = "https://cofrgojpwdyzfhfqnlch.supabase.co/functions/v1/device-machine-event";
+const char* MACHINE_EVENT_URL = "https://wcctsctasnxekcdseman.supabase.co/functions/v1/device-machine-event";
 // Batch ingest (v1.5.0): one POST carries many events to the device_events_push RPC, stamped with seq + ts
 // so the server stores exact device time and de-dupes. PostgREST needs the PUBLIC anon key in the headers
 // (it is published in the web app; it does nothing without a valid device key in the body).
-const char* EVENTS_RPC_URL  = "https://cofrgojpwdyzfhfqnlch.supabase.co/rest/v1/rpc/device_events_push";
-const char* SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNvZnJnb2pwd2R5emZoZnFubGNoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc0Mzg0MjIsImV4cCI6MjA5MzAxNDQyMn0.fc1dOwvHJEhRDDnfOzj4EpqhoN9qE2CWf9T8995yoBM";
+const char* EVENTS_RPC_URL  = "https://wcctsctasnxekcdseman.supabase.co/rest/v1/rpc/device_events_push";
+const char* SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndjY3RzY3Rhc254ZWtjZHNlbWFuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTM4ODAwNjIsImV4cCI6MjEwOTQ1NjA2Mn0.06NiVFrlK3J7ZsQK6u_HavF_yx8yLAYZHE-g074geSs";
 const char* INJECTION_DEVICE_ID = "ec089dbd-7269-4c1d-86b8-e425400f80bf";  // machine 7 (board 7): injection monitor
 const char* MACHINE6_DEVICE_ID  = "03100ff2-811b-47af-ba77-fe204ec1f9e6";  // machine 6 (board 6): injection monitor
 
